@@ -28,7 +28,9 @@ from typing import Any
 
 GENERATOR_DIR = Path(__file__).resolve().parent
 DEFAULT_COOKIE_FILE = GENERATOR_DIR / "cookie.txt"
-DEFAULT_BROWSER_PROFILE = GENERATOR_DIR / "data" / "browser-profile"
+# Keep the automation profile separate from the user's normal Edge profile.
+# This is also the profile initialized by the independent-browser setup flow.
+DEFAULT_BROWSER_PROFILE = GENERATOR_DIR / "data" / "browser-profile-independent"
 DEFAULT_PAGE_URL = "https://www.icloud.com/icloudplus/"
 AUTH_COOKIE_NAMES = {
     "x-apple-webauth-token",

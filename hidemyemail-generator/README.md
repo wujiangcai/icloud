@@ -77,6 +77,9 @@ This project includes `refresh_cookie.py`. It launches a persistent Edge
 profile, reads the current iCloud browser session, validates it against the
 iCloud setup service, and atomically updates `cookie.txt`. Cookie values are
 never printed by the script, and an unsuccessful refresh keeps the old file.
+The default profile is the isolated directory
+`hidemyemail-generator\data\browser-profile-independent`, so it does not lock
+the user's normal Edge profile.
 
 Install the updated requirements and initialize the dedicated browser profile:
 
