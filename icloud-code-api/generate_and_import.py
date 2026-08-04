@@ -170,7 +170,9 @@ def main() -> int:
         "HME_SUCCESS_DELAY_SECONDS": str(max(0, args.success_delay)),
         "HME_FAILURE_DELAY_SECONDS": str(max(0, args.failure_delay)),
     }
-    cookie_file = Path(os.environ.get("HME_COOKIE_FILE", str(GENERATOR_DIR / "cookie.txt"))).expanduser()
+    cookie_file = Path(
+        os.environ.get("HME_COOKIE_FILE", str(GENERATOR_DIR / "cookie.txt"))
+    ).expanduser().resolve()
     if not args.no_cookie_refresh and env_flag("HME_AUTO_REFRESH_COOKIE", True):
         refresh_result = refresh_cookie_before_generate(
             generator_python=generator_python,

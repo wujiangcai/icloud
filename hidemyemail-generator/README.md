@@ -90,8 +90,10 @@ The same setup can be started by double-clicking the root-level
 
 Complete iCloud sign-in/verification in the opened window once. Later runs of
 `icloud-code-api\generate_and_import.py` refresh the session automatically
-before generating aliases. The scheduled task uses headless mode and reuses
-the same profile.
+before generating aliases. The scheduled task uses headless mode; when Apple
+keeps the session cookie as a session-only browser cookie, it validates and
+reuses the already refreshed `cookie.txt` instead of replacing it with an
+empty headless capture.
 
 If the normal Edge profile is already logged in, close Edge completely and run
 the following once instead of using the dedicated profile:

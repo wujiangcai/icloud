@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
 import sys
@@ -46,6 +47,10 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 def browser_origin(region: str) -> str:
     return "https://www.icloud.com.cn" if region == "china" else "https://www.icloud.com"
+
+
+def setup_origin(region: str) -> str:
+    return "https://setup.icloud.com.cn" if region == "china" else "https://setup.icloud.com"
 
 
 def login_url(region: str, page_url: str) -> str:
@@ -136,7 +141,11 @@ def cookie_fingerprint(cookie_header: str) -> str:
     return digest if parts else ""
 
 
-async def validate_cookie(cookie_header: str, region: str) -> dict[str, str | bool]:
+async def validate_cookie(
+    cookie_header: str,
+    region: str,
+    maildomain_host: str = "",
+) -> dict[str, str | bool]:
     """Validate the cookie through Apple's setup session endpoint."""
     # Import lazily so ``refresh_cookie.py --help`` remains useful even when
     # the generator's runtime dependencies have not been installed yet.
@@ -147,7 +156,11 @@ async def validate_cookie(cookie_header: str, region: str) -> dict[str, str | bo
         return {"valid": False, "error": f"cannot import generator client: {exc}"}
 
     try:
-        client = HideMyEmail(cookies=cookie_header, region=region)
+        client = HideMyEmail(
+            cookies=cookie_header,
+            region=region,
+            maildomain_host=maildomain_host,
+        )
         async with client:
             context_error = str(getattr(client, "_context_error", "") or "")
             if context_error:
@@ -155,6 +168,17 @@ async def validate_cookie(cookie_header: str, region: str) -> dict[str, str | bo
             host = str(getattr(client, "maildomain_host", "") or "")
             if "maildomainws.icloud." not in host:
                 return {"valid": False, "error": "Apple did not return a maildomain service"}
+            if maildomain_host:
+                response = await client.list_email()
+                if not response or not response.get("success"):
+                    return {
+                        "valid": False,
+                        "error": str(
+                            response.get("reason")
+                            or response.get("error")
+                            or "Hide My Email list validation failed"
+                        ),
+                    }
             return {
                 "valid": True,
                 "error": "",
@@ -162,6 +186,46 @@ async def validate_cookie(cookie_header: str, region: str) -> dict[str, str | bo
             }
     except Exception as exc:
         return {"valid": False, "error": str(exc)}
+
+
+def validate_cookie_sync(
+    cookie_header: str,
+    region: str,
+    maildomain_host: str = "",
+) -> dict[str, str | bool]:
+    """Run aiohttp validation outside Playwright's sync event-loop thread."""
+    # Playwright's synchronous API owns an internal asyncio loop.  Calling
+    # asyncio.run() directly from that thread raises ``asyncio.run() cannot
+    # be called from a running event loop`` as soon as authenticated cookies
+    # are found.  A short-lived worker thread gives the validator its own loop.
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="hme-cookie-check") as pool:
+        future = pool.submit(
+            asyncio.run,
+            validate_cookie(cookie_header, region, maildomain_host),
+        )
+        return future.result()
+
+
+def validate_existing_cookie_file(path: Path, region: str) -> dict[str, str | bool]:
+    """Validate an already written cookie without trusting its cached host.
+
+    A session cookie can remain valid in ``cookie.txt`` even when a new
+    headless browser process cannot persist Apple's session-only cookies.  In
+    that case the existing file is sufficient for the generator and should
+    not be replaced with an empty browser capture.
+    """
+    if not path.exists():
+        return {"valid": False, "error": "cookie file does not exist"}
+    try:
+        sys.path.insert(0, str(GENERATOR_DIR))
+        from main import load_cookie_context
+
+        cookie_header, maildomain_host = load_cookie_context(path)
+    except Exception as exc:
+        return {"valid": False, "error": str(exc)}
+    if not cookie_header:
+        return {"valid": False, "error": "cookie file is empty"}
+    return validate_cookie_sync(cookie_header, region, maildomain_host)
 
 
 def write_cookie_file(
@@ -213,11 +277,20 @@ def import_playwright():
 def collect_context_cookies(context: Any, urls: list[str]) -> str:
     items: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
+    sources: list[list[dict[str, Any]]] = []
+    try:
+        # Some Apple auth cookies are host-only on setup.icloud.com rather
+        # than visible to www.icloud.com.  Reading the whole context keeps
+        # both sets while the domain filter below excludes unrelated sites.
+        sources.append(context.cookies())
+    except Exception:
+        pass
     for url in urls:
         try:
-            current = context.cookies(url)
+            sources.append(context.cookies(url))
         except Exception:
             continue
+    for current in sources:
         for item in current:
             key = (
                 str(item.get("name") or ""),
@@ -323,7 +396,7 @@ def refresh_cookie(args: argparse.Namespace) -> int:
     # not treat failure as a fatal condition.
     browser_cookie = try_browser_cookie_database(browser)
     if auth_cookie_count(browser_cookie) > 0:
-        validation = asyncio.run(validate_cookie(browser_cookie, region))
+        validation = validate_cookie_sync(browser_cookie, region)
         if bool(validation.get("valid")):
             host = str(validation.get("maildomain_host") or "")
             write_cookie_file(cookie_file, browser_cookie, host)
@@ -335,6 +408,19 @@ def refresh_cookie(args: argparse.Namespace) -> int:
         print("[cookie-refresh] browser cookie was found but did not validate; using persistent profile")
     else:
         print("[cookie-refresh] direct browser-cookie access unavailable; using persistent profile")
+
+    # Session-only Apple cookies may be available in a headed context but not
+    # survive a later headless Edge launch.  Scheduled/API runs can safely use
+    # the existing file when Apple's service still accepts it; a truly expired
+    # file will fail validation and the headed setup flow remains required.
+    if args.headless:
+        existing_validation = validate_existing_cookie_file(cookie_file, region)
+        if bool(existing_validation.get("valid")):
+            print(
+                "[cookie-refresh] existing cookie.txt is still valid; "
+                "no browser refresh was needed"
+            )
+            return 0
 
     profile.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + max(0, args.wait_seconds)
@@ -371,13 +457,17 @@ def refresh_cookie(args: argparse.Namespace) -> int:
             except Exception as exc:
                 print(f"[cookie-refresh] page navigation note: {exc}")
 
-            urls = [page_url, f"{browser_origin(region)}/settings/"]
+            urls = [
+                page_url,
+                f"{browser_origin(region)}/settings/",
+                f"{setup_origin(region)}/",
+            ]
             while True:
                 cookie_header = collect_context_cookies(context, urls)
                 current_fingerprint = cookie_fingerprint(cookie_header)
                 if auth_cookie_count(cookie_header) > 0 and current_fingerprint != last_fingerprint:
                     last_fingerprint = current_fingerprint
-                    last_validation = asyncio.run(validate_cookie(cookie_header, region))
+                    last_validation = validate_cookie_sync(cookie_header, region)
                     if bool(last_validation.get("valid")):
                         host = str(last_validation.get("maildomain_host") or "")
                         write_cookie_file(cookie_file, cookie_header, host)
