@@ -71,6 +71,40 @@ request whose URL contains `maildomainws` or `/v1/hme`/`/v2/hme` while the
 iCloud page is open. A static page request can return HTTP 200 while its
 session token is no longer accepted by the Hide My Email service.
 
+## Automatic Cookie refresh on Windows
+
+This project includes `refresh_cookie.py`. It launches a persistent Edge
+profile, reads the current iCloud browser session, validates it against the
+iCloud setup service, and atomically updates `cookie.txt`. Cookie values are
+never printed by the script, and an unsuccessful refresh keeps the old file.
+
+Install the updated requirements and initialize the dedicated browser profile:
+
+```powershell
+hidemyemail-generator\.venv\Scripts\python.exe -m pip install -r hidemyemail-generator\requirements.txt
+hidemyemail-generator\.venv\Scripts\python.exe hidemyemail-generator\refresh_cookie.py --headed
+```
+
+The same setup can be started by double-clicking the root-level
+`refresh_cookie.bat`.
+
+Complete iCloud sign-in/verification in the opened window once. Later runs of
+`icloud-code-api\generate_and_import.py` refresh the session automatically
+before generating aliases. The scheduled task uses headless mode and reuses
+the same profile.
+
+If the normal Edge profile is already logged in, close Edge completely and run
+the following once instead of using the dedicated profile:
+
+```powershell
+hidemyemail-generator\.venv\Scripts\python.exe hidemyemail-generator\refresh_cookie.py --use-existing-profile --headed
+```
+
+For a different profile or browser, set `HME_BROWSER_PROFILE`, `HME_BROWSER`
+(`msedge`, `chrome`, or `chromium`), and optionally
+`HME_BROWSER_PROFILE_DIRECTORY`. Use `--no-cookie-refresh` on
+`generate_and_import.py` only when manually maintaining `cookie.txt`.
+
 # License
 
 Licensed under the MIT License - see the [LICENSE file](./LICENSE) for more details.

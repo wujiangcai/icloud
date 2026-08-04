@@ -1148,6 +1148,13 @@ def schedule_log_summary() -> dict[str, Any]:
     )
     latest_segment = raw.splitlines()[latest_start_position:] if latest_start_position >= 0 else raw.splitlines()
     latest_segment_text = "\n".join(latest_segment)
+    cookie_refresh_failed = bool(
+        re.search(
+            r"cookie refresh failed|no authenticated iCloud cookies found|session validation failed|no valid iCloud login was found|previous cookie\.txt was kept unchanged",
+            latest_segment_text,
+            re.IGNORECASE,
+        )
+    )
     cookie_expired = bool(
         re.search(
             r"invalid global\s+session|session is invalid or expired|expired.*cookie|cookie.*expired|capture a fresh.*cookie",
@@ -1155,7 +1162,11 @@ def schedule_log_summary() -> dict[str, Any]:
             re.IGNORECASE,
         )
     )
-    if cookie_expired:
+    if cookie_refresh_failed:
+        latest_event = events[-1]
+        latest_event["status"] = "action_required"
+        latest_event["message"] = "无法自动获取有效 iCloud Cookie，请在浏览器中完成登录/验证"
+    elif cookie_expired:
         latest_event = events[-1]
         latest_event["status"] = "action_required"
         latest_event["message"] = "iCloud Cookie/会话已过期，请更新 cookie.txt"

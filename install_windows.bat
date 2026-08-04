@@ -17,5 +17,7 @@ if errorlevel 1 (
   exit /b 1
 )
 echo [3/3] Done.
-echo Next: copy hidemyemail-generator\cookie.txt.example to cookie.txt and paste your iCloud cookie.
+echo First-time Cookie setup:
+echo   hidemyemail-generator\.venv\Scripts\python.exe hidemyemail-generator\refresh_cookie.py --headed
+echo Sign in to iCloud in the opened browser once. Future generation runs refresh Cookie automatically.
 pause

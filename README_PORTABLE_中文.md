@@ -92,6 +92,16 @@ generate_and_import.bat 10
 脚本会自动从 `icloud-code-api\data\secrets.json` 读取 Admin Key；也可以按
 `COUNT ADMIN_KEY API_URL SUCCESS_DELAY FAILURE_DELAY` 顺序显式传入参数。
 
+首次使用自动刷新 Cookie：
+
+```powershell
+hidemyemail-generator\.venv\Scripts\python.exe -m pip install -r hidemyemail-generator\requirements.txt
+hidemyemail-generator\.venv\Scripts\python.exe hidemyemail-generator\refresh_cookie.py --headed
+```
+
+在打开的 Edge 窗口完成 iCloud 登录和验证一次。之后创建脚本和定时任务会
+在创建邮箱前自动刷新并验证 Cookie；验证失败不会覆盖旧的 `cookie.txt`。
+
 默认节奏：
 
 - 成功后等待 100 秒

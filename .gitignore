@@ -13,6 +13,7 @@ icloud-code-api/config.json
 icloud-code-api/data/
 hidemyemail-generator/cookie.txt
 hidemyemail-generator/emails.txt
+hidemyemail-generator/data/
 
 # Runtime logs and local databases
 *.log

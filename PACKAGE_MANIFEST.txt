@@ -1,4 +1,5 @@
 ﻿generate_and_import.bat
+refresh_cookie.bat
 install_hme_schedule.bat
 install_hme_schedule.ps1
 schedule_generate.py
@@ -16,6 +17,7 @@ hidemyemail-generator\icloud\__init__.py
 hidemyemail-generator\icloud\hidemyemail.py
 hidemyemail-generator\LICENSE
 hidemyemail-generator\main.py
+hidemyemail-generator\refresh_cookie.py
 hidemyemail-generator\README.md
 hidemyemail-generator\requirements.txt
 icloud-code-api\.gitignore

@@ -64,6 +64,67 @@ def read_emails(path: Path) -> list[str]:
     return emails
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def refresh_cookie_before_generate(
+    *,
+    generator_python: str,
+    cookie_file: Path,
+    wait_seconds: int,
+) -> int:
+    """Refresh the browser session before starting any alias operation.
+
+    Interactive runs open a visible browser so the user can complete Apple
+    login/2FA.  Scheduler/API runs use headless mode and reuse the dedicated
+    persistent profile that was initialized once by the user.
+    """
+    refresh_script = GENERATOR_DIR / "refresh_cookie.py"
+    if not refresh_script.exists():
+        print(f"Cookie refresh script not found: {refresh_script}", file=sys.stderr)
+        return 2
+
+    command = [
+        generator_python,
+        str(refresh_script),
+        "--cookie-file",
+        str(cookie_file),
+        "--wait-seconds",
+        str(max(0, wait_seconds)),
+    ]
+    # When stdout is connected to a terminal, show the browser and allow a
+    # first-time login.  The scheduler captures stdout, so it defaults to
+    # headless and never steals focus every 30 minutes.
+    force_headless = "HME_COOKIE_REFRESH_HEADLESS" in os.environ
+    headless = (
+        env_flag("HME_COOKIE_REFRESH_HEADLESS")
+        if force_headless
+        else not sys.stdout.isatty()
+    )
+    if env_flag("HME_COOKIE_REFRESH_HEADED"):
+        headless = False
+    command.append("--headless" if headless else "--headed")
+
+    print("Refreshing iCloud browser session before generation...")
+    completed = subprocess.run(
+        command,
+        cwd=str(GENERATOR_DIR),
+        env=os.environ.copy(),
+        check=False,
+    )
+    if completed.returncode != 0:
+        print(
+            "Cookie refresh failed. Run refresh_cookie.py --headed, complete "
+            "iCloud login in the opened browser, and retry.",
+            file=sys.stderr,
+        )
+    return completed.returncode
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate Hide My Email aliases and import them into iCloud Code API.")
     parser.add_argument("--count", type=int, default=1, help="How many aliases to successfully generate")
@@ -71,6 +132,17 @@ def main() -> int:
     parser.add_argument("--failure-delay", type=int, default=120, help="Seconds to wait after each failed attempt")
     parser.add_argument("--api-url", default="http://127.0.0.1:8765", help="iCloud Code API base URL")
     parser.add_argument("--admin-key", default="", help="Admin API key. Defaults to data/secrets.json")
+    parser.add_argument(
+        "--no-cookie-refresh",
+        action="store_true",
+        help="Skip automatic browser Cookie refresh (not recommended)",
+    )
+    parser.add_argument(
+        "--cookie-refresh-wait",
+        type=int,
+        default=int(os.environ.get("HME_COOKIE_REFRESH_WAIT_SECONDS", "90")),
+        help="Seconds to wait for browser login when refreshing Cookie",
+    )
     args = parser.parse_args()
 
     admin_key = args.admin_key.strip() or read_admin_key()
@@ -98,6 +170,15 @@ def main() -> int:
         "HME_SUCCESS_DELAY_SECONDS": str(max(0, args.success_delay)),
         "HME_FAILURE_DELAY_SECONDS": str(max(0, args.failure_delay)),
     }
+    cookie_file = Path(os.environ.get("HME_COOKIE_FILE", str(GENERATOR_DIR / "cookie.txt"))).expanduser()
+    if not args.no_cookie_refresh and env_flag("HME_AUTO_REFRESH_COOKIE", True):
+        refresh_result = refresh_cookie_before_generate(
+            generator_python=generator_python,
+            cookie_file=cookie_file,
+            wait_seconds=args.cookie_refresh_wait,
+        )
+        if refresh_result != 0:
+            return refresh_result
     completed = subprocess.run(cmd, cwd=str(GENERATOR_DIR), check=False, env=env)
     if completed.returncode != 0:
         return completed.returncode
