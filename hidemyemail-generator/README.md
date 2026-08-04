@@ -98,6 +98,34 @@ keeps the session cookie as a session-only browser cookie, it validates and
 reuses the already refreshed `cookie.txt` instead of replacing it with an
 empty headless capture.
 
+For the least manual work, keep the isolated browser session alive between
+generation runs:
+
+```powershell
+.\install_hme_browser_session.bat
+```
+
+This registers a per-user logon task and starts a dedicated Edge window that
+checks the session every five minutes. It does not use or lock the normal
+Edge profile. You can also run `keep_cookie_session.bat` directly. Remove the
+logon task with `uninstall_hme_browser_session.bat`.
+
+Apple can still invalidate a session or require a new verification. When that
+happens the isolated window stays available and the keep-alive task continues
+checking until you finish the one required verification. The current state is
+written to:
+
+```text
+hidemyemail-generator\data\browser-session-status.json
+hidemyemail-generator\data\browser-session.log
+```
+
+The local admin dashboard also displays this status. A successful login is
+reused automatically by the generator and by the 30-minute scheduled job.
+The workflow does not store an Apple password or attempt to bypass Apple's
+password/2FA checks; if Apple invalidates the session, one interactive
+verification is still required.
+
 If the normal Edge profile is already logged in, close Edge completely and run
 the following once instead of using the dedicated profile:
 

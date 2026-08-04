@@ -18,10 +18,12 @@ import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import json
 import os
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,8 @@ DEFAULT_COOKIE_FILE = GENERATOR_DIR / "cookie.txt"
 # Keep the automation profile separate from the user's normal Edge profile.
 # This is also the profile initialized by the independent-browser setup flow.
 DEFAULT_BROWSER_PROFILE = GENERATOR_DIR / "data" / "browser-profile-independent"
+DEFAULT_STATUS_FILE = GENERATOR_DIR / "data" / "browser-session-status.json"
+DEFAULT_SESSION_LOG_FILE = GENERATOR_DIR / "data" / "browser-session.log"
 DEFAULT_PAGE_URL = "https://www.icloud.com/icloudplus/"
 AUTH_COOKIE_NAMES = {
     "x-apple-webauth-token",
@@ -38,6 +42,45 @@ AUTH_COOKIE_NAMES = {
     "x-apple-webauth-login",
     "x-apple-webauth-validate",
 }
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    """Write a small local status file without exposing cookie contents."""
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def append_session_log(path: Path, message: str) -> None:
+    """Append a short status line; callers must not pass cookie values."""
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{utc_now()}] {message}\n")
+
+
+def load_status(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -230,6 +273,60 @@ def validate_existing_cookie_file(path: Path, region: str) -> dict[str, str | bo
     return validate_cookie_sync(cookie_header, region, maildomain_host)
 
 
+def read_cookie_source(path: Path) -> tuple[str, str]:
+    """Read the project's cookie format without logging its contents."""
+    if not path.exists():
+        return "", ""
+    try:
+        sys.path.insert(0, str(GENERATOR_DIR))
+        from main import load_cookie_context
+
+        return load_cookie_context(path)
+    except Exception:
+        return "", ""
+
+
+def context_cookie_items(cookie_header: str, region: str) -> list[dict[str, Any]]:
+    """Convert a Cookie header into cookies that Playwright can seed."""
+    domain = ".icloud.com.cn" if region == "china" else ".icloud.com"
+    items: list[dict[str, Any]] = []
+    for part in str(cookie_header or "").split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name or not value:
+            continue
+        # __Host- cookies cannot carry a Domain attribute.  Apple auth
+        # cookies normally are not __Host- cookies, but skip incompatible
+        # entries rather than making context.add_cookies fail as a whole.
+        if name.lower().startswith("__host-"):
+            continue
+        items.append(
+            {
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": "/",
+                "secure": True,
+            }
+        )
+    return items
+
+
+def seed_browser_context(context: Any, cookie_header: str, region: str) -> int:
+    """Seed a new context from the last validated cookie file."""
+    items = context_cookie_items(cookie_header, region)
+    if not items:
+        return 0
+    try:
+        context.add_cookies(items)
+    except Exception:
+        return 0
+    return len(items)
+
+
 def write_cookie_file(
     path: Path,
     cookie_header: str,
@@ -373,6 +470,8 @@ def refresh_cookie(args: argparse.Namespace) -> int:
     sync_playwright, PlaywrightTimeoutError = import_playwright()
     browser = normalize_browser_name(args.browser)
     cookie_file = Path(args.cookie_file).expanduser()
+    status_file = Path(args.status_file).expanduser()
+    session_log_file = Path(args.session_log_file).expanduser()
     region = args.region
     page_url = login_url(region, args.page_url)
 
@@ -385,12 +484,71 @@ def refresh_cookie(args: argparse.Namespace) -> int:
     if profile == cookie_file.resolve():
         raise RuntimeError("browser profile and cookie file cannot be the same path")
 
-    print(f"[cookie-refresh] browser={browser}; profile={profile}")
-    print(f"[cookie-refresh] opening {page_url}")
+    status = load_status(status_file)
+    # Headless generation checks may run while the visible keep-alive task
+    # owns the same profile.  They must not overwrite the task's dashboard
+    # status with a transient profile-lock/error state.
+    persist_status = bool(args.keep_alive or not args.headless)
+    status.update(
+        {
+            "browser": browser,
+            "profile": str(profile),
+            "cookie_file": str(cookie_file.resolve()),
+            "status_file": str(status_file.resolve()),
+            "keep_alive": bool(args.keep_alive),
+            "interval_seconds": max(15, args.interval_seconds),
+            "updated_at": utc_now(),
+        }
+    )
+
+    def session_event(
+        state: str,
+        message: str,
+        *,
+        auth_count: int | None = None,
+        error: str = "",
+    ) -> None:
+        """Persist a secret-free state and mirror it to stdout/log."""
+        stamp = utc_now()
+        status.update(
+            {
+                "state": state,
+                "message": message,
+                "updated_at": stamp,
+            }
+        )
+        if auth_count is not None:
+            status["auth_cookie_count"] = auth_count
+        if error:
+            status["last_error"] = error
+        elif state == "authenticated":
+            status["last_error"] = ""
+        if state == "authenticated":
+            status["last_success_at"] = stamp
+        if persist_status:
+            try:
+                atomic_write_json(status_file, status)
+                append_session_log(session_log_file, message)
+            except OSError as exc:
+                # Status persistence must never prevent a valid Cookie refresh.
+                print(f"[cookie-refresh] status log note: {exc}", file=sys.stderr)
+        print(f"[cookie-refresh] {message}", flush=True)
+
+    session_event(
+        "starting",
+        f"starting {browser} session refresh; opening {page_url}",
+    )
+
     if args.use_existing_profile:
-        print("[cookie-refresh] using the existing browser profile; close that browser first if launch fails")
+        session_event(
+            "starting",
+            "using the existing browser profile; close that browser first if launch fails",
+        )
     else:
-        print("[cookie-refresh] dedicated profile: sign in once here if this is the first run")
+        session_event(
+            "starting",
+            "using the dedicated browser profile; sign in once here if this is the first run",
+        )
 
     # This can immediately reuse the normal logged-in browser without opening
     # another window when the OS allows the cookie database to be decrypted.
@@ -402,14 +560,25 @@ def refresh_cookie(args: argparse.Namespace) -> int:
         if bool(validation.get("valid")):
             host = str(validation.get("maildomain_host") or "")
             write_cookie_file(cookie_file, browser_cookie, host)
-            print(
-                "[cookie-refresh] success: reused the logged-in browser cookie "
-                f"and updated {cookie_file} (auth cookies found: {auth_cookie_count(browser_cookie)})"
+            session_event(
+                "authenticated",
+                f"reused the logged-in browser cookie and updated {cookie_file} "
+                f"(auth cookies found: {auth_cookie_count(browser_cookie)})",
+                auth_count=auth_cookie_count(browser_cookie),
             )
-            return 0
-        print("[cookie-refresh] browser cookie was found but did not validate; using persistent profile")
+            if not args.keep_alive:
+                return 0
+        session_event(
+            "login_required",
+            "browser cookie was found but did not validate; using the dedicated persistent profile",
+        )
     else:
-        print("[cookie-refresh] direct browser-cookie access unavailable; using persistent profile")
+        session_event(
+            "starting",
+            "direct browser-cookie access unavailable; using the dedicated persistent profile",
+        )
+
+    seed_cookie_header, _ = read_cookie_source(cookie_file)
 
     # Session-only Apple cookies may be available in a headed context but not
     # survive a later headless Edge launch.  Scheduled/API runs can safely use
@@ -418,9 +587,10 @@ def refresh_cookie(args: argparse.Namespace) -> int:
     if args.headless:
         existing_validation = validate_existing_cookie_file(cookie_file, region)
         if bool(existing_validation.get("valid")):
-            print(
-                "[cookie-refresh] existing cookie.txt is still valid; "
-                "no browser refresh was needed"
+            session_event(
+                "authenticated",
+                "existing cookie.txt is still valid; no browser refresh was needed",
+                auth_count=auth_cookie_count(seed_cookie_header),
             )
             return 0
 
@@ -429,6 +599,10 @@ def refresh_cookie(args: argparse.Namespace) -> int:
     last_fingerprint = ""
     last_validation: dict[str, str | bool] | None = None
     login_hint_printed = False
+    last_check_at = 0.0
+    session_established = False
+    keepalive_notice_printed = False
+    last_page_touch_at = 0.0
     context = None
     try:
         with sync_playwright() as playwright:
@@ -448,16 +622,49 @@ def refresh_cookie(args: argparse.Namespace) -> int:
                     ) from exc
                 raise RuntimeError(f"无法启动浏览器：{exc}") from exc
 
+            # Never blindly overwrite a still-live profile session with an
+            # older cookie.txt.  Apple may keep the web-auth token in the
+            # browser profile only; replacing it during a restart can turn a
+            # valid session into an invalid one.  Seed the file only when the
+            # profile does not already contain a complete authenticated set.
+            profile_cookie_header = collect_context_cookies(
+                context,
+                [
+                    page_url,
+                    f"{browser_origin(region)}/settings/",
+                    f"{setup_origin(region)}/",
+                ],
+            )
+            profile_auth_count = auth_cookie_count(profile_cookie_header)
+            if profile_auth_count < 3:
+                seeded_count = seed_browser_context(context, seed_cookie_header, region)
+                if seeded_count:
+                    session_event(
+                        "starting",
+                        f"seeded the dedicated browser with {seeded_count} existing cookies",
+                    )
+            else:
+                seeded_count = 0
+                session_event(
+                    "starting",
+                    "kept the existing authenticated cookies in the dedicated browser profile",
+                    auth_count=profile_auth_count,
+                )
+
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(8_000)
             try:
                 page.goto(page_url, wait_until="domcontentloaded", timeout=20_000)
+                last_page_touch_at = time.monotonic()
             except PlaywrightTimeoutError:
                 # iCloud can keep subresources open; cookies may already be
                 # usable after DOMContentLoaded, so continue polling.
-                print("[cookie-refresh] page load is still settling; checking session cookies")
+                session_event(
+                    "starting",
+                    "page load is still settling; checking session cookies",
+                )
             except Exception as exc:
-                print(f"[cookie-refresh] page navigation note: {exc}")
+                session_event("starting", f"page navigation note: {exc}")
 
             urls = [
                 page_url,
@@ -465,40 +672,131 @@ def refresh_cookie(args: argparse.Namespace) -> int:
                 f"{setup_origin(region)}/",
             ]
             while True:
+                if (
+                    args.keep_alive
+                    and session_established
+                    and time.monotonic() - last_page_touch_at
+                    >= max(15, args.interval_seconds)
+                ):
+                    last_page_touch_at = time.monotonic()
+                    try:
+                        page.reload(
+                            wait_until="domcontentloaded",
+                            timeout=20_000,
+                        )
+                    except PlaywrightTimeoutError:
+                        session_event(
+                            "authenticated",
+                            "keep-alive page refresh is still settling; checking session cookies",
+                        )
+                    except Exception as exc:
+                        if args.keep_alive:
+                            session_event(
+                                "browser_closed",
+                                "the independent browser closed or stopped responding; "
+                                "the task will restart it",
+                                error=str(exc),
+                            )
+                            break
                 cookie_header = collect_context_cookies(context, urls)
                 current_fingerprint = cookie_fingerprint(cookie_header)
-                if auth_cookie_count(cookie_header) > 0 and current_fingerprint != last_fingerprint:
+                now = time.monotonic()
+                should_validate = (
+                    auth_cookie_count(cookie_header) > 0
+                    and (
+                        current_fingerprint != last_fingerprint
+                        or (
+                            args.keep_alive
+                            and now - last_check_at >= max(15, args.interval_seconds)
+                        )
+                    )
+                )
+                if should_validate:
                     last_fingerprint = current_fingerprint
+                    last_check_at = now
                     last_validation = validate_cookie_sync(cookie_header, region)
                     if bool(last_validation.get("valid")):
                         host = str(last_validation.get("maildomain_host") or "")
                         write_cookie_file(cookie_file, cookie_header, host)
-                        print(
-                            "[cookie-refresh] success: validated the iCloud session "
-                            f"and updated {cookie_file} (auth cookies found: {auth_cookie_count(cookie_header)})"
-                        )
-                        return 0
+                        if not session_established:
+                            session_event(
+                                "authenticated",
+                                f"validated the iCloud session and updated {cookie_file} "
+                                f"(auth cookies found: {auth_cookie_count(cookie_header)})",
+                                auth_count=auth_cookie_count(cookie_header),
+                            )
+                        elif args.keep_alive:
+                            session_event(
+                                "authenticated",
+                                "keep-alive check passed; cookie file refreshed "
+                                f"(auth cookies found: {auth_cookie_count(cookie_header)})",
+                                auth_count=auth_cookie_count(cookie_header),
+                            )
+                        session_established = True
+                        login_hint_printed = False
+                        if not args.keep_alive:
+                            return 0
+                        if not keepalive_notice_printed:
+                            session_event(
+                                "authenticated",
+                                "keep-alive active; "
+                                f"checking every {max(15, args.interval_seconds)} seconds",
+                                auth_count=auth_cookie_count(cookie_header),
+                            )
+                            keepalive_notice_printed = True
+                        last_validation = None
+                        continue
                     error = str(last_validation.get("error") or "validation failed")
-                    print(f"[cookie-refresh] session validation failed: {error}")
+                    session_event(
+                        "login_required",
+                        f"session validation failed: {error}",
+                        auth_count=auth_cookie_count(cookie_header),
+                        error=error,
+                    )
+                    session_established = False
 
                 if not login_hint_printed:
                     if auth_cookie_count(cookie_header) == 0:
-                        print(
-                            "[cookie-refresh] no authenticated iCloud cookies found. "
-                            "Complete login/verification in the opened browser window."
+                        session_event(
+                            "login_required",
+                            "no authenticated iCloud cookies found. Complete login/verification "
+                            "in the opened browser window.",
+                            auth_count=0,
                         )
                     elif last_validation and not bool(last_validation.get("valid")):
-                        print(
-                            "[cookie-refresh] the browser session is not accepted by Hide My Email. "
-                            "Sign in again in the opened window, then wait for a retry."
+                        session_event(
+                            "login_required",
+                            "the browser session is not accepted by Hide My Email. Sign in again "
+                            "in the opened window, then wait for a retry.",
+                            auth_count=auth_cookie_count(cookie_header),
                         )
                     login_hint_printed = True
 
-                if time.monotonic() >= deadline:
+                # A keep-alive process is intentionally long-lived even when
+                # Apple asks for a new login.  The visible window must remain
+                # available so the user can complete verification later.
+                if (
+                    not args.keep_alive
+                    and not session_established
+                    and time.monotonic() >= deadline
+                ):
                     break
                 try:
-                    page.wait_for_timeout(1_000)
-                except Exception:
+                    wait_seconds = (
+                        max(15, args.interval_seconds)
+                        if args.keep_alive and session_established
+                        else 1
+                    )
+                    page.wait_for_timeout(wait_seconds * 1_000)
+                except Exception as exc:
+                    if args.keep_alive:
+                        session_event(
+                            "browser_closed",
+                            "the independent browser closed or stopped responding; "
+                            "the task will restart it",
+                            error=str(exc),
+                        )
+                        break
                     time.sleep(1)
 
         # Context is closed by the Playwright manager here.
@@ -510,14 +808,15 @@ def refresh_cookie(args: argparse.Namespace) -> int:
                 pass
 
     if last_validation and not bool(last_validation.get("valid")):
-        print(
-            "[cookie-refresh] failed: iCloud session could not be validated; "
-            "the previous cookie.txt was kept unchanged."
+        session_event(
+            "login_required",
+            "failed: iCloud session could not be validated; the previous cookie.txt was kept unchanged.",
+            error=str(last_validation.get("error") or "validation failed"),
         )
     else:
-        print(
-            "[cookie-refresh] failed: no valid iCloud login was found; "
-            "the previous cookie.txt was kept unchanged."
+        session_event(
+            "login_required",
+            "failed: no valid iCloud login was found; the previous cookie.txt was kept unchanged.",
         )
     return 3
 
@@ -530,6 +829,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--cookie-file",
         default=os.environ.get("HME_COOKIE_FILE", str(DEFAULT_COOKIE_FILE)),
         help="Output cookie file (default: hidemyemail-generator/cookie.txt)",
+    )
+    parser.add_argument(
+        "--status-file",
+        default=os.environ.get("HME_COOKIE_STATUS_FILE", str(DEFAULT_STATUS_FILE)),
+        help="Secret-free browser session status JSON file",
+    )
+    parser.add_argument(
+        "--session-log-file",
+        default=os.environ.get(
+            "HME_COOKIE_SESSION_LOG_FILE", str(DEFAULT_SESSION_LOG_FILE)
+        ),
+        help="Secret-free browser session log file",
     )
     parser.add_argument(
         "--profile",
@@ -580,6 +891,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force a visible browser window",
     )
+    parser.add_argument(
+        "--keep-alive",
+        action="store_true",
+        default=env_bool("HME_COOKIE_KEEP_ALIVE"),
+        help="Keep the independent browser open and refresh the cookie periodically",
+    )
+    parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=int(os.environ.get("HME_COOKIE_KEEP_ALIVE_INTERVAL_SECONDS", "300")),
+        help="Keep-alive validation interval (default: 300 seconds)",
+    )
     return parser
 
 
@@ -587,6 +910,11 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.headed:
         args.headless = False
+    if args.keep_alive and args.headless:
+        print("[cookie-refresh] --keep-alive requires a visible browser; omit --headless", file=sys.stderr)
+        return 2
+    if args.keep_alive:
+        args.interval_seconds = max(15, args.interval_seconds)
     try:
         return refresh_cookie(args)
     except KeyboardInterrupt:

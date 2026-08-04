@@ -252,11 +252,10 @@ class HideMyEmail:
                 or not isinstance(data, dict)
                 or not data.get("success", True)
             ):
-                last_error = str(
-                    data.get("reason")
-                    or data.get("error")
-                    or f"HTTP {resp.status}"
-                )
+                raw_error = data.get("reason") or data.get("error")
+                if raw_error == 1:
+                    raw_error = "Apple rejected the iCloud session (error=1)"
+                last_error = str(raw_error or f"HTTP {resp.status}")
                 continue
 
             ds_info = data.get("dsInfo") or {}

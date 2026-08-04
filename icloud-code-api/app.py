@@ -41,6 +41,9 @@ DB_PATH = DATA_DIR / "icloud_code_api.sqlite3"
 SCHEDULE_TASK_NAME = "iCloud Hide My Email - 30min"
 SCHEDULE_STATE_PATH = DATA_DIR / "hme_schedule_state.json"
 SCHEDULE_LOG_PATH = DATA_DIR / "hme_schedule.log"
+GENERATOR_DATA_DIR = APP_DIR.parent / "hidemyemail-generator" / "data"
+BROWSER_SESSION_STATUS_PATH = GENERATOR_DATA_DIR / "browser-session-status.json"
+BROWSER_SESSION_LOG_PATH = GENERATOR_DATA_DIR / "browser-session.log"
 SCHEDULE_INTERVAL_MINUTES = 30
 SCHEDULE_INITIAL_COUNT = 4
 SCHEDULE_RECURRING_COUNT = 5
@@ -1033,6 +1036,36 @@ def schedule_status_payload() -> dict[str, Any]:
     }
 
 
+def browser_session_status_payload() -> dict[str, Any]:
+    """Expose the independent iCloud browser-session health without secrets."""
+    state = load_json_file(BROWSER_SESSION_STATUS_PATH)
+    allowed = {
+        "state",
+        "message",
+        "browser",
+        "profile",
+        "keep_alive",
+        "interval_seconds",
+        "auth_cookie_count",
+        "updated_at",
+        "last_success_at",
+        "last_error",
+    }
+    payload = {key: state[key] for key in allowed if key in state}
+    payload.update(
+        {
+            "available": bool(state),
+            "status_file": str(BROWSER_SESSION_STATUS_PATH),
+            "log_file": str(BROWSER_SESSION_LOG_PATH),
+        }
+    )
+    if not payload.get("state"):
+        payload["state"] = "unknown"
+    if not payload.get("message"):
+        payload["message"] = "尚未运行独立 iCloud 浏览器会话保活"
+    return payload
+
+
 SCHEDULE_ACTIONS: dict[str, tuple[list[str], str]] = {
     "start": (
         ["/Change", "/TN", SCHEDULE_TASK_NAME, "/ENABLE"],
@@ -1234,6 +1267,7 @@ def dashboard_payload() -> dict[str, Any]:
             "admin_key_digest": secret_digest(str(cfg.get("admin_key") or "")),
         },
         "schedule": schedule_status_payload(),
+        "browser_session": browser_session_status_payload(),
     }
 
 
@@ -1404,6 +1438,15 @@ ADMIN_HTML = r"""<!doctype html>
         <div class="schedule-log-message" id="scheduleLogMessage">正在读取日志...</div>
         <div class="muted mono schedule-log-time" id="scheduleLogTime"></div>
         <div class="schedule-log-list" id="scheduleLogEntries"></div>
+      </div>
+      <div class="schedule-log" id="browserSessionPanel">
+        <div class="inline" style="justify-content:space-between">
+          <b>iCloud 独立浏览器登录会话</b>
+          <span class="pill" id="browserSessionBadge">读取中</span>
+        </div>
+        <div class="schedule-log-message" id="browserSessionMessage">正在读取会话状态...</div>
+        <div class="muted mono schedule-log-time" id="browserSessionTime"></div>
+        <div class="muted mono schedule-paths" id="browserSessionPaths"></div>
       </div>
       <div class="toast" id="scheduleToast"></div>
     </section>
@@ -1655,6 +1698,27 @@ ADMIN_HTML = r"""<!doctype html>
         return `<div class="schedule-log-entry"><span class="muted mono">${esc(formatScheduleTime(entry.at))}</span><span class="pill">${esc(entryLabel)}</span><span>${esc(entry.message || "")}</span></div>`;
       }).join("");
     };
+    const renderBrowserSession = (session = {}) => {
+      const state = session.state || "unknown";
+      const labels = {
+        authenticated: "已登录",
+        starting: "启动中",
+        login_required: "需要登录",
+        browser_closed: "浏览器已关闭",
+        unknown: "未知",
+      };
+      const needsAction = ["login_required", "browser_closed"].includes(state);
+      const statusClass = state === "authenticated" ? "ok" : needsAction ? "bad" : "";
+      $("browserSessionBadge").textContent = labels[state] || state;
+      $("browserSessionBadge").className = `pill ${statusClass}`;
+      $("browserSessionMessage").textContent = session.message || "暂无会话状态";
+      $("browserSessionMessage").className = `schedule-log-message ${statusClass}`;
+      $("browserSessionTime").textContent = session.updated_at
+        ? `更新时间：${formatScheduleTime(session.updated_at)}`
+        : "";
+      $("browserSessionPaths").textContent =
+        `状态文件：${session.status_file || "-"}　日志：${session.log_file || "-"}`;
+    };
     const scheduleActionButtons = ["scheduleStart", "scheduleStop", "scheduleRunNow"];
     const scheduleAction = async (action) => {
       try {
@@ -1674,7 +1738,7 @@ ADMIN_HTML = r"""<!doctype html>
 
     async function loadDashboard() {
       const payload = await api("/api/dashboard");
-      const { summary, aliases, schedule } = payload;
+      const { summary, aliases, schedule, browser_session } = payload;
       aliasState.aliases = aliases;
       $("statAliases").textContent = summary.alias_count;
       $("statMessages").textContent = summary.message_count;
@@ -1683,6 +1747,7 @@ ADMIN_HTML = r"""<!doctype html>
       $("statImap").className = summary.imap_configured ? "ok" : "bad";
       $("adminDigest").textContent = `Admin Key 指纹：${summary.admin_key_digest}`;
       renderSchedule(schedule);
+      renderBrowserSession(browser_session);
 
       $("messageAlias").innerHTML = `<option value="">全部邮箱</option>` + aliases.map(a => `<option value="${esc(a.email)}">${esc(a.email)}</option>`).join("");
       renderGroupFilter();

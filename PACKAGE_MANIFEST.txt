@@ -1,9 +1,14 @@
 ﻿generate_and_import.bat
 refresh_cookie.bat
+keep_cookie_session.bat
 install_hme_schedule.bat
+install_hme_browser_session.bat
+install_hme_browser_session.ps1
 install_hme_schedule.ps1
 schedule_generate.py
 uninstall_hme_schedule.bat
+uninstall_hme_browser_session.bat
+uninstall_hme_browser_session.ps1
 uninstall_hme_schedule.ps1
 hidemyemail-generator\.gitignore
 hidemyemail-generator\cli.py
