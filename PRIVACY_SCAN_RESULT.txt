@@ -1,0 +1,7 @@
+﻿Privacy scan result:
+Expected placeholder-only hits are allowed: cookie.txt.example, config.example*.json, README examples.
+
+BAD_NAME_HITS: none
+CONTENT_HITS:
+E:\codex\dist\icloud-hide-email-workflow-portable-20260704-142420\icloud-code-api\README.md:44:alias002@icloud.com----alias_custom_key
+E:\codex\dist\icloud-hide-email-workflow-portable-20260704-142420\icloud-code-api\README.md:45:alias003@icloud.com----alias_custom_key----标签----备注

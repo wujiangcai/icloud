@@ -1,0 +1,26 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# Local credentials, cookies, generated addresses, and runtime data
+icloud-code-api/config.json
+icloud-code-api/data/
+hidemyemail-generator/cookie.txt
+hidemyemail-generator/emails.txt
+
+# Runtime logs and local databases
+*.log
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Local editor/system files
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,20 @@
+{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "admin_key": "change-this-admin-key",
+  "imap": {
+    "host": "imap.mail.me.com",
+    "port": 993,
+    "username": "yourname@icloud.com",
+    "app_password": "xxxx-xxxx-xxxx-xxxx",
+    "mailbox": "INBOX",
+    "timeout_seconds": 30
+  },
+  "sync": {
+    "lookback_days": 3,
+    "recent_limit": 200,
+    "code_max_age_seconds": 3600,
+    "request_sync_cooldown_seconds": 8,
+    "scan_body_for_alias": false
+  }
+}

@@ -1,0 +1,3 @@
+﻿# 把从 iCloud.com 导出的 Cookie 字符串粘贴到这里
+# 注意：不要把这个文件发给别人
+# 也可以粘贴 DevTools 的 Copy as cURL 文本；程序会提取最后一个带认证 Cookie 的请求。
