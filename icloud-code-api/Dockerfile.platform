@@ -6,7 +6,9 @@ ENV PYTHONUNBUFFERED=1 PYTHONUTF8=1
 COPY requirements-platform.txt ./
 RUN pip install --no-cache-dir -r requirements-platform.txt
 
-COPY app.py platform_app.py platform_worker.py operator.html ./
+COPY app.py platform_app.py platform_worker.py operator.html operator.css operator.js ./
+COPY python ./python
+COPY vendor ./vendor
 RUN mkdir -p /app/data/platform \
     && useradd --create-home --uid 10001 app \
     && chown -R app:app /app

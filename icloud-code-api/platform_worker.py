@@ -11,7 +11,7 @@ import signal
 import time
 from datetime import datetime, timezone
 
-from platform_app import env_int, sync_all_mailboxes
+from platform_app import env_int, process_generation_jobs, sync_all_mailboxes
 
 
 INTERVAL_SECONDS = env_int("PLATFORM_WORKER_INTERVAL_SECONDS", 30, 10, 3600)
@@ -32,10 +32,11 @@ def main() -> None:
         started = time.monotonic()
         try:
             results = sync_all_mailboxes()
+            jobs = process_generation_jobs()
             ok = sum(1 for item in results if item.get("ok"))
             print(
                 f"{datetime.now(timezone.utc).isoformat()} sync complete: "
-                f"mailboxes={len(results)} ok={ok} failed={len(results) - ok}",
+                f"sources={len(results)} ok={ok} failed={len(results) - ok} generation_jobs={len(jobs)}",
                 flush=True,
             )
         except Exception as exc:  # keep the scheduler alive after a DB/IMAP error

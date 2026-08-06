@@ -6,10 +6,13 @@ import base64
 import hashlib
 import hmac
 import imaplib
+import json
 import os
 import re
 import secrets
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -23,7 +26,7 @@ from typing import Any
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from app import clean_text, extract_code, message_body_text
@@ -36,10 +39,19 @@ KEY_PATH = DATA_DIR / "platform_master.key"
 OPERATOR_KEY_PATH = DATA_DIR / "platform_admin.key"
 OPERATOR_HTML_PATH = APP_DIR / "operator.html"
 MAX_BODY = 1_048_576
-SERVICE_VERSION = "0.1.0"
+SERVICE_VERSION = "0.2.0"
 INVENTORY_TENANT_ID = "__platform_inventory__"
 INVENTORY_TENANT_EMAIL = "platform-inventory@platform.invalid"
 INVENTORY_TENANT_DISPLAY = "\u5e73\u53f0\u5e93\u5b58\uff08\u672a\u5206\u914d\u5ba2\u6237\uff09"
+BUSINESS_STATUS_LABELS = {
+    "inventory": "库存中",
+    "sold": "已卖出",
+    "self_member": "自用会员",
+    "self_no_member": "自用未开会员",
+    "disabled": "停用",
+    "trash": "失效/垃圾",
+}
+BUSINESS_STATUSES = tuple(BUSINESS_STATUS_LABELS)
 
 
 def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -55,6 +67,16 @@ def env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_configured_hme_bridge = Path(os.environ.get("PLATFORM_HME_BRIDGE", str(APP_DIR / "python" / "hme_bridge.py")))
+HME_BRIDGE_PATH = _configured_hme_bridge if _configured_hme_bridge.is_absolute() else APP_DIR / _configured_hme_bridge
+HME_PYTHON = os.environ.get("PLATFORM_HME_PYTHON", sys.executable).strip() or sys.executable
+HME_BRIDGE_TIMEOUT = env_int("PLATFORM_HME_BRIDGE_TIMEOUT_SECONDS", 180, 30, 900)
+HME_GENERATION_BATCH_LIMIT = env_int("PLATFORM_HME_GENERATION_BATCH_LIMIT", 5, 1, 5)
+HME_GENERATION_TARGET_MAX = env_int("PLATFORM_HME_GENERATION_TARGET_MAX", 700, 1, 5000)
+HME_GENERATION_COOLDOWN_MINUTES = env_int("PLATFORM_HME_GENERATION_COOLDOWN_MINUTES", 60, 0, 1440)
+HME_GENERATION_RETRY_MINUTES = env_int("PLATFORM_HME_GENERATION_RETRY_MINUTES", 5, 1, 60)
 
 
 def load_operator_html() -> str:
@@ -261,14 +283,45 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS operator_sessions(
               token_hash TEXT PRIMARY KEY,expires_at TEXT NOT NULL,created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS icloud_accounts(
+              id TEXT PRIMARY KEY,apple_id TEXT NOT NULL DEFAULT '',identity_key TEXT NOT NULL UNIQUE,
+              dsid TEXT NOT NULL DEFAULT '',display_name TEXT NOT NULL DEFAULT '',region TEXT NOT NULL DEFAULT 'auto',
+              user_partition TEXT NOT NULL DEFAULT '',maildomain_host TEXT NOT NULL DEFAULT '',
+              cookie_ciphertext TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'active',
+              label_prefix TEXT NOT NULL DEFAULT 'icloud',label_sequence INTEGER NOT NULL DEFAULT 0,
+              cooldown_until TEXT NOT NULL DEFAULT '',last_apple_sync_at TEXT NOT NULL DEFAULT '',
+              last_imap_sync_at TEXT NOT NULL DEFAULT '',last_error TEXT NOT NULL DEFAULT '',
+              imap_username TEXT NOT NULL DEFAULT '',imap_host TEXT NOT NULL DEFAULT 'imap.mail.me.com',
+              imap_port INTEGER NOT NULL DEFAULT 993,imap_mailbox TEXT NOT NULL DEFAULT 'INBOX',
+              imap_credential_ciphertext TEXT NOT NULL DEFAULT '',imap_last_uid INTEGER NOT NULL DEFAULT 0,
+              imap_uid_validity TEXT NOT NULL DEFAULT '',imap_backfill_done INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS generation_jobs(
+              id TEXT PRIMARY KEY,account_id TEXT NOT NULL,target_total INTEGER NOT NULL,batch_size INTEGER NOT NULL,
+              label_prefix TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',generated_count INTEGER NOT NULL DEFAULT 0,
+              last_error TEXT NOT NULL DEFAULT '',next_run_at TEXT NOT NULL DEFAULT '',last_run_at TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+              FOREIGN KEY(account_id) REFERENCES icloud_accounts(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS generation_results(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,job_id TEXT NOT NULL,email TEXT NOT NULL DEFAULT '',
+              apple_label TEXT NOT NULL DEFAULT '',status TEXT NOT NULL,error_text TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,
+              FOREIGN KEY(job_id) REFERENCES generation_jobs(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS mailboxes(
               id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,email TEXT NOT NULL,imap_username TEXT NOT NULL DEFAULT '',label TEXT NOT NULL DEFAULT '',
+              account_id TEXT,apple_label TEXT NOT NULL DEFAULT '',apple_active INTEGER NOT NULL DEFAULT 1,
+              source TEXT NOT NULL DEFAULT 'manual',business_status TEXT NOT NULL DEFAULT 'inventory',
+              customer_id TEXT NOT NULL DEFAULT '',order_no TEXT NOT NULL DEFAULT '',sold_at TEXT NOT NULL DEFAULT '',
+              used_at TEXT NOT NULL DEFAULT '',membership_at TEXT NOT NULL DEFAULT '',note TEXT NOT NULL DEFAULT '',
               imap_host TEXT NOT NULL DEFAULT 'imap.mail.me.com',imap_port INTEGER NOT NULL DEFAULT 993,
               mailbox TEXT NOT NULL DEFAULT 'INBOX',credential_ciphertext TEXT NOT NULL,
               api_key_hash TEXT NOT NULL,api_key_prefix TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,
               last_sync_at TEXT NOT NULL DEFAULT '',last_error TEXT NOT NULL DEFAULT '',
               created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(tenant_id,email),
-              FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+              FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
+              FOREIGN KEY(account_id) REFERENCES icloud_accounts(id) ON DELETE SET NULL
             );
             CREATE TABLE IF NOT EXISTS messages(
               id INTEGER PRIMARY KEY AUTOINCREMENT,tenant_id TEXT NOT NULL,mailbox_id TEXT NOT NULL,
@@ -295,6 +348,9 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_sessions_tenant ON sessions(tenant_id);
             CREATE INDEX IF NOT EXISTS idx_operator_sessions_expiry ON operator_sessions(expires_at);
             CREATE INDEX IF NOT EXISTS idx_mailboxes_tenant ON mailboxes(tenant_id);
+            CREATE INDEX IF NOT EXISTS idx_icloud_accounts_status ON icloud_accounts(status,updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_generation_jobs_due ON generation_jobs(status,next_run_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_generation_jobs_one_active ON generation_jobs(account_id) WHERE status IN ('queued','running');
             CREATE INDEX IF NOT EXISTS idx_messages_mailbox_time ON messages(mailbox_id,received_at DESC);
             CREATE INDEX IF NOT EXISTS idx_public_access_token ON public_access(token_hash);
             CREATE TABLE IF NOT EXISTS r2_usage(
@@ -309,8 +365,27 @@ def init_db() -> None:
                 (INVENTORY_TENANT_ID, INVENTORY_TENANT_EMAIL, hash_password(secrets.token_urlsafe(48)), 1, now_iso()),
             )
         mailbox_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mailboxes)").fetchall()}
-        if "imap_username" not in mailbox_columns:
-            conn.execute("ALTER TABLE mailboxes ADD COLUMN imap_username TEXT NOT NULL DEFAULT ''")
+        mailbox_migrations = {
+            "imap_username": "ALTER TABLE mailboxes ADD COLUMN imap_username TEXT NOT NULL DEFAULT ''",
+            "account_id": "ALTER TABLE mailboxes ADD COLUMN account_id TEXT",
+            "apple_label": "ALTER TABLE mailboxes ADD COLUMN apple_label TEXT NOT NULL DEFAULT ''",
+            "apple_active": "ALTER TABLE mailboxes ADD COLUMN apple_active INTEGER NOT NULL DEFAULT 1",
+            "source": "ALTER TABLE mailboxes ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
+            "business_status": "ALTER TABLE mailboxes ADD COLUMN business_status TEXT NOT NULL DEFAULT 'inventory'",
+            "customer_id": "ALTER TABLE mailboxes ADD COLUMN customer_id TEXT NOT NULL DEFAULT ''",
+            "order_no": "ALTER TABLE mailboxes ADD COLUMN order_no TEXT NOT NULL DEFAULT ''",
+            "sold_at": "ALTER TABLE mailboxes ADD COLUMN sold_at TEXT NOT NULL DEFAULT ''",
+            "used_at": "ALTER TABLE mailboxes ADD COLUMN used_at TEXT NOT NULL DEFAULT ''",
+            "membership_at": "ALTER TABLE mailboxes ADD COLUMN membership_at TEXT NOT NULL DEFAULT ''",
+            "note": "ALTER TABLE mailboxes ADD COLUMN note TEXT NOT NULL DEFAULT ''",
+        }
+        for name, statement in mailbox_migrations.items():
+            if name not in mailbox_columns:
+                conn.execute(statement)
+        conn.execute("UPDATE mailboxes SET business_status='inventory' WHERE business_status IS NULL OR business_status=''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mailboxes_account_status ON mailboxes(account_id,business_status,created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mailboxes_status ON mailboxes(business_status,updated_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mailboxes_email ON mailboxes(email)")
         message_columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
         if "r2_object_key" not in message_columns:
             conn.execute("ALTER TABLE messages ADD COLUMN r2_object_key TEXT NOT NULL DEFAULT ''")
@@ -340,6 +415,127 @@ def verify_password(password: str, encoded: str) -> bool:
 
 def token_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def account_identity_key(region: str, dsid: str, apple_id: str) -> str:
+    return hashlib.sha256(f"{region}:{dsid or apple_id}".encode("utf-8", "ignore")).hexdigest()
+
+
+def normalize_region(value: str | None) -> str:
+    region = str(value or "auto").strip().lower()
+    if region not in {"auto", "global", "china"}:
+        raise HTTPException(400, "region must be auto, global or china")
+    return region
+
+
+def normalize_label_prefix(value: str | None, fallback: str = "icloud") -> str:
+    prefix = str(value or fallback).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,24}", prefix):
+        raise HTTPException(400, "label prefix may contain only letters, numbers, underscore and hyphen")
+    return prefix
+
+
+def validate_business_status(value: str) -> str:
+    status = str(value or "").strip().lower()
+    if status not in BUSINESS_STATUSES:
+        raise HTTPException(400, f"invalid business status; allowed: {', '.join(BUSINESS_STATUSES)}")
+    return status
+
+
+def call_hme_bridge(command: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Call the copied new-icloud Apple HME bridge without exposing CK in logs."""
+    if not HME_BRIDGE_PATH.is_file():
+        raise RuntimeError(f"HME bridge not found: {HME_BRIDGE_PATH}")
+    try:
+        completed = subprocess.run(
+            [HME_PYTHON, str(HME_BRIDGE_PATH), command],
+            input=json.dumps(payload, ensure_ascii=False),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=HME_BRIDGE_TIMEOUT,
+            cwd=str(APP_DIR),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Apple HME operation timed out") from exc
+    except OSError as exc:
+        raise RuntimeError(f"unable to start Apple HME bridge: {exc}") from exc
+    output = (completed.stdout or "").strip().splitlines()
+    data: dict[str, Any] | None = None
+    for line in reversed(output):
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            data = candidate
+            break
+    if data is None:
+        detail = (completed.stderr or completed.stdout or "bridge returned no JSON").strip()[-500:]
+        raise RuntimeError(detail)
+    if completed.returncode != 0 or data.get("ok") is False:
+        raise RuntimeError(str(data.get("error") or "Apple HME operation failed")[:500])
+    return data
+
+
+def prepare_icloud_account(cookie: str, region: str) -> dict[str, str]:
+    result = call_hme_bridge("validate", {"cookie": cookie, "region": normalize_region(region)})
+    if not result.get("featureAvailable"):
+        raise RuntimeError("Apple account does not have Hide My Email enabled")
+    apple_id = normalize_email(str(result.get("appleId") or ""))
+    dsid = str(result.get("dsid") or "")
+    resolved_region = str(result.get("region") or region or "auto")
+    if not apple_id and not dsid:
+        raise RuntimeError("Apple account identity was not returned")
+    return {
+        "apple_id": apple_id,
+        "dsid": dsid,
+        "display_name": str(result.get("displayName") or "")[:160],
+        "region": resolved_region,
+        "user_partition": str(result.get("userPartition") or "")[:160],
+        "maildomain_host": str(result.get("maildomainHost") or "")[:255],
+        "cookie": str(result.get("cookie") or cookie),
+        "identity_key": account_identity_key(resolved_region, dsid, apple_id),
+    }
+
+
+def get_icloud_account(account_id: str, include_deleted: bool = False) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM icloud_accounts WHERE id=?", (account_id,)).fetchone()
+    if row is None or (not include_deleted and row["status"] == "deleted"):
+        raise HTTPException(404, "iCloud account not found")
+    return dict(row)
+
+
+def public_icloud_account(row: dict[str, Any]) -> dict[str, Any]:
+    counts = row.get("status_counts") or {}
+    return {
+        "id": row["id"],
+        "apple_id": row.get("apple_id") or "",
+        "dsid": row.get("dsid") or "",
+        "display_name": row.get("display_name") or "",
+        "region": row.get("region") or "auto",
+        "maildomain_host": row.get("maildomain_host") or "",
+        "status": row.get("status") or "active",
+        "label_prefix": row.get("label_prefix") or "icloud",
+        "label_sequence": int(row.get("label_sequence") or 0),
+        "cooldown_until": row.get("cooldown_until") or None,
+        "last_apple_sync_at": row.get("last_apple_sync_at") or None,
+        "last_imap_sync_at": row.get("last_imap_sync_at") or None,
+        "last_error": row.get("last_error") or None,
+        "imap_username": row.get("imap_username") or "",
+        "imap_host": row.get("imap_host") or "imap.mail.me.com",
+        "imap_port": int(row.get("imap_port") or 993),
+        "imap_mailbox": row.get("imap_mailbox") or "INBOX",
+        "imap_configured": bool(row.get("imap_credential_ciphertext") and row.get("imap_username")),
+        "created_at": row.get("created_at") or "",
+        "updated_at": row.get("updated_at") or "",
+        "address_count": int(row.get("address_count") or 0),
+        "status_counts": counts,
+        "latest_job": row.get("latest_job") or None,
+    }
 
 
 def issue_session(tenant_id: str) -> tuple[str, int]:
@@ -420,6 +616,45 @@ class OperatorMailboxCredentialsPayload(BaseModel):
     label: str | None = Field(default=None, max_length=80)
 
 
+class ICloudAccountImportPayload(BaseModel):
+    cookie: str = Field(..., min_length=20, max_length=200_000)
+    region: str = Field(default="auto", max_length=20)
+
+
+class ICloudAccountImapPayload(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+    app_password: str | None = Field(default=None, min_length=1, max_length=128)
+    host: str = Field(default="imap.mail.me.com", min_length=1, max_length=255)
+    port: int = Field(default=993, ge=1, le=65535)
+    mailbox: str = Field(default="INBOX", min_length=1, max_length=255)
+
+
+class ICloudGenerationPayload(BaseModel):
+    count: int = Field(default=1, ge=1, le=5)
+    label_prefix: str | None = Field(default=None, max_length=24)
+
+
+class ICloudCampaignPayload(BaseModel):
+    target_total: int = Field(..., ge=1, le=5000)
+    batch_size: int = Field(default=5, ge=1, le=5)
+    label_prefix: str | None = Field(default=None, max_length=24)
+
+
+class BusinessStatusPayload(BaseModel):
+    status: str = Field(..., min_length=1, max_length=32)
+    customer_id: str | None = Field(default=None, max_length=64)
+    order_no: str | None = Field(default=None, max_length=128)
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class BusinessStatusBatchPayload(BaseModel):
+    ids: list[str] = Field(..., min_length=1, max_length=500)
+    status: str = Field(..., min_length=1, max_length=32)
+    customer_id: str | None = Field(default=None, max_length=64)
+    order_no: str | None = Field(default=None, max_length=128)
+    note: str | None = Field(default=None, max_length=1000)
+
+
 class OperatorLoginPayload(BaseModel):
     key: str = Field(..., min_length=8, max_length=256)
 
@@ -491,6 +726,9 @@ def tenant_mailbox(tenant_id: str, mailbox_id: str) -> dict[str, Any]:
 def public_mailbox(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": row["id"], "email": row["email"], "label": row["label"],
+        "business_status": row.get("business_status") or "inventory",
+        "business_status_label": BUSINESS_STATUS_LABELS.get(row.get("business_status"), "库存中"),
+        "account_id": row.get("account_id"), "apple_label": row.get("apple_label") or "",
         "imap_host": row["imap_host"], "imap_port": row["imap_port"],
         "mailbox": row["mailbox"], "api_key_prefix": row["api_key_prefix"],
         "active": bool(row["active"]), "last_sync_at": row["last_sync_at"] or None,
@@ -557,7 +795,326 @@ def reserve_r2_upload(byte_count: int) -> bool:
     return True
 
 
+def account_summary_rows() -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT a.*,
+              COUNT(m.id) AS address_count,
+              (SELECT j.status FROM generation_jobs j WHERE j.account_id=a.id ORDER BY j.created_at DESC LIMIT 1) AS latest_job
+            FROM icloud_accounts a
+            LEFT JOIN mailboxes m ON m.account_id=a.id
+            WHERE a.status!='deleted'
+            GROUP BY a.id
+            ORDER BY a.created_at DESC
+            """
+        ).fetchall()
+        summaries = []
+        for raw in rows:
+            row = dict(raw)
+            counts = {
+                status: int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM mailboxes WHERE account_id=? AND business_status=?",
+                        (row["id"], status),
+                    ).fetchone()[0]
+                )
+                for status in BUSINESS_STATUSES
+            }
+            row["status_counts"] = counts
+            summaries.append(row)
+    return summaries
+
+
+def upsert_icloud_account(prepared: dict[str, str]) -> dict[str, Any]:
+    stamp = now_iso()
+    cookie_ciphertext = FERNET.encrypt(prepared["cookie"].encode()).decode("ascii")
+    fallback_prefix = re.sub(r"[^A-Za-z0-9_-]", "_", prepared["apple_id"].split("@", 1)[0])[:24] or "icloud"
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT id,label_prefix,label_sequence FROM icloud_accounts WHERE identity_key=?",
+            (prepared["identity_key"],),
+        ).fetchone()
+        if existing is None:
+            account_id = uuid.uuid4().hex
+            conn.execute(
+                """
+                INSERT INTO icloud_accounts(
+                  id,apple_id,identity_key,dsid,display_name,region,user_partition,maildomain_host,
+                  cookie_ciphertext,status,label_prefix,label_sequence,last_apple_sync_at,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,'active',?,0,?,?,?)
+                """,
+                (
+                    account_id, prepared["apple_id"], prepared["identity_key"], prepared["dsid"],
+                    prepared["display_name"], prepared["region"], prepared["user_partition"],
+                    prepared["maildomain_host"], cookie_ciphertext, fallback_prefix, stamp, stamp, stamp,
+                ),
+            )
+        else:
+            account_id = existing["id"]
+            conn.execute(
+                """
+                UPDATE icloud_accounts SET apple_id=?,dsid=?,display_name=?,region=?,user_partition=?,
+                  maildomain_host=?,cookie_ciphertext=?,status='active',last_error='',updated_at=? WHERE id=?
+                """,
+                (
+                    prepared["apple_id"], prepared["dsid"], prepared["display_name"], prepared["region"],
+                    prepared["user_partition"], prepared["maildomain_host"], cookie_ciphertext, stamp, account_id,
+                ),
+            )
+    return get_icloud_account(account_id)
+
+
+def upsert_hme_addresses(account_id: str, rows: list[dict[str, Any]], source: str) -> list[dict[str, Any]]:
+    """Merge Apple-returned aliases into the production mailbox table.
+
+    Existing business status, customer and public access records are preserved;
+    the Apple account relationship is the only ownership metadata changed here.
+    """
+    account = get_icloud_account(account_id)
+    created_or_updated: list[dict[str, Any]] = []
+    with db() as conn:
+        for item in rows:
+            email = normalize_email(str(item.get("email") or ""))
+            if not valid_email(email):
+                continue
+            label = str(item.get("label") or "")[:80]
+            created_at = str(item.get("createdAt") or now_iso())[:64]
+            existing = conn.execute(
+                "SELECT * FROM mailboxes WHERE lower(email)=? ORDER BY created_at LIMIT 1",
+                (email,),
+            ).fetchone()
+            if existing is not None:
+                stamp = now_iso()
+                if not account["imap_username"] and existing["imap_username"] and existing["credential_ciphertext"]:
+                    conn.execute(
+                        "UPDATE icloud_accounts SET imap_username=?,imap_host=?,imap_port=?,imap_mailbox=?,imap_credential_ciphertext=?,updated_at=? WHERE id=?",
+                        (
+                            existing["imap_username"], existing["imap_host"], existing["imap_port"], existing["mailbox"],
+                            existing["credential_ciphertext"], stamp, account_id,
+                        ),
+                    )
+                conn.execute(
+                    """
+                    UPDATE mailboxes SET account_id=?,apple_label=?,apple_active=1,source=?,
+                      label=CASE WHEN label='' THEN ? ELSE label END,updated_at=? WHERE id=?
+                    """,
+                    (account_id, label, source, label, stamp, existing["id"]),
+                )
+                created_or_updated.append({"id": existing["id"], "email": email, "created": False})
+                continue
+            mailbox_id = uuid.uuid4().hex
+            api_key = "mb_" + secrets.token_urlsafe(32)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO mailboxes(
+                      id,tenant_id,email,imap_username,label,account_id,apple_label,apple_active,source,business_status,
+                      credential_ciphertext,api_key_hash,api_key_prefix,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,'inventory',?,?,?,?,?)
+                    """,
+                    (
+                        mailbox_id, INVENTORY_TENANT_ID, email, "", label, account_id, label, 1, source,
+                        "", token_hash(api_key), api_key[:12], created_at, created_at,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                existing = conn.execute("SELECT id FROM mailboxes WHERE lower(email)=? LIMIT 1", (email,)).fetchone()
+                if existing is None:
+                    raise
+                conn.execute(
+                    "UPDATE mailboxes SET account_id=?,apple_label=?,apple_active=1,source=?,updated_at=? WHERE id=?",
+                    (account_id, label, source, now_iso(), existing["id"]),
+                )
+                mailbox_id = existing["id"]
+                created_or_updated.append({"id": mailbox_id, "email": email, "created": False})
+                continue
+            created_or_updated.append({"id": mailbox_id, "email": email, "created": True})
+    return created_or_updated
+
+
+def mark_account_address_sync(account_id: str, returned_emails: set[str], maildomain_host: str) -> None:
+    stamp = now_iso()
+    with db() as conn:
+        if returned_emails:
+            placeholders = ",".join("?" for _ in returned_emails)
+            conn.execute(
+                f"UPDATE mailboxes SET apple_active=0,updated_at=? WHERE account_id=? AND lower(email) NOT IN ({placeholders})",
+                (stamp, account_id, *sorted(returned_emails)),
+            )
+        else:
+            conn.execute("UPDATE mailboxes SET apple_active=0,updated_at=? WHERE account_id=?", (stamp, account_id))
+        conn.execute(
+            "UPDATE icloud_accounts SET maildomain_host=COALESCE(NULLIF(?,''),maildomain_host),last_apple_sync_at=?,last_error='',updated_at=? WHERE id=?",
+            (maildomain_host, stamp, stamp, account_id),
+        )
+
+
+def _store_parsed_message(row: dict[str, Any], uid: str, raw_email: bytes, message: Any) -> tuple[bool, int, int]:
+    subject = clean_text(str(message.get("Subject") or ""))[:500]
+    sender = clean_text(str(message.get("From") or ""))[:500]
+    recipients = clean_text(
+        " ".join(str(message.get_all(name, []) or "") for name in ("To", "Cc", "Delivered-To", "X-Original-To", "Envelope-To", "Apparently-To"))
+    )[:1000]
+    body = message_body_text(message)
+    code = extract_code("\n".join((subject, sender, recipients, body)))
+    received = parse_date(str(message.get("Date") or ""))
+    message_id = clean_text(str(message.get("Message-ID") or ""))[:500]
+    with db() as conn:
+        before = conn.execute(
+            "SELECT id,r2_object_key FROM messages WHERE mailbox_id=? AND imap_uid=?",
+            (row["id"], uid),
+        ).fetchone()
+    r2_key = str(before["r2_object_key"] or "") if before is not None else ""
+    archived = 0
+    r2_errors = 0
+    r2_error = ""
+    if R2_STORAGE.configured and R2_ARCHIVE_ENABLED and not r2_key:
+        if not reserve_r2_upload(len(raw_email)):
+            r2_errors += 1
+            r2_error = "R2 monthly safety budget reached or message is too large"
+            if R2_REQUIRED:
+                raise RuntimeError(r2_error)
+        else:
+            try:
+                r2_key = R2_STORAGE.archive_message(row["tenant_id"], row["id"], uid, raw_email)
+                archived = 1
+            except Exception as exc:
+                r2_errors += 1
+                r2_error = clean_text(str(exc))[:300] or "R2 archive failed"
+                if R2_REQUIRED:
+                    raise RuntimeError(r2_error) from exc
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO messages(tenant_id,mailbox_id,imap_uid,message_id,from_addr,to_addrs,subject,body_preview,code,r2_object_key,r2_error,received_at,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(mailbox_id,imap_uid) DO UPDATE SET
+              message_id=excluded.message_id,from_addr=excluded.from_addr,to_addrs=excluded.to_addrs,
+              subject=excluded.subject,body_preview=excluded.body_preview,code=excluded.code,
+              r2_object_key=CASE WHEN excluded.r2_object_key!='' THEN excluded.r2_object_key ELSE messages.r2_object_key END,
+              r2_error=excluded.r2_error,received_at=excluded.received_at
+            """,
+            (
+                row["tenant_id"], row["id"], uid, message_id, sender, recipients, subject, body[:280], code,
+                r2_key, r2_error, received.isoformat(), now_iso(),
+            ),
+        )
+    return before is None, archived, r2_errors
+
+
+def sync_icloud_account(account_id: str) -> dict[str, Any]:
+    lock = sync_lock(f"icloud-account:{account_id}")
+    if not lock.acquire(blocking=False):
+        return {"ok": True, "skipped": True, "reason": "account sync already running", "account_id": account_id}
+    client = None
+    try:
+        account = get_icloud_account(account_id)
+        if account["status"] != "active":
+            raise RuntimeError("iCloud account is not active")
+        if not account["imap_username"] or not account["imap_credential_ciphertext"]:
+            raise RuntimeError("please configure the primary iCloud mailbox and App-specific password first")
+        try:
+            password = FERNET.decrypt(account["imap_credential_ciphertext"].encode()).decode()
+        except (InvalidToken, UnicodeDecodeError) as exc:
+            raise RuntimeError("iCloud account IMAP credential cannot be decrypted") from exc
+        login_email = resolve_imap_login_email(account["imap_username"], account["imap_username"])
+        with db() as conn:
+            aliases = [dict(row) for row in conn.execute(
+                "SELECT * FROM mailboxes WHERE account_id=? AND active=1 AND apple_active=1 ORDER BY created_at",
+                (account_id,),
+            ).fetchall()]
+        by_email = {normalize_email(row["email"]): row for row in aliases}
+        client = imaplib.IMAP4_SSL(
+            account["imap_host"], int(account["imap_port"]),
+            timeout=env_int("PLATFORM_IMAP_TIMEOUT_SECONDS", 30, 5, 300),
+        )
+        client.login(login_email, password)
+        status_code, _ = client.select(account["imap_mailbox"] or "INBOX", readonly=True)
+        if status_code != "OK":
+            raise RuntimeError("unable to open account mailbox")
+        last_uid = int(account.get("imap_last_uid") or 0)
+        uid_validity = ""
+        try:
+            response = client.response("UIDVALIDITY")
+            if response and len(response) > 1 and response[1]:
+                raw_validity = response[1][0] if isinstance(response[1], (list, tuple)) else response[1]
+                uid_validity = str(raw_validity, "ascii", "ignore") if isinstance(raw_validity, bytes) else str(raw_validity)
+        except Exception:
+            uid_validity = ""
+        if account.get("imap_uid_validity") and uid_validity and account["imap_uid_validity"] != uid_validity:
+            last_uid = 0
+        if last_uid:
+            status_code, data = client.uid("search", None, f"UID {last_uid + 1}:*")
+            if status_code != "OK":
+                last_uid = 0
+        if not last_uid:
+            since = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+            status_code, data = client.uid("search", None, f"(SINCE {since})")
+        uids = (data[0] or b"").split()[-RECENT_LIMIT:] if status_code == "OK" and data and data[0] is not None else []
+        inspected = inserted = archived = r2_errors = 0
+        highest_uid = int(account.get("imap_last_uid") or 0)
+        for uid_bytes in uids:
+            uid = uid_bytes.decode("ascii", errors="ignore")
+            if not uid:
+                continue
+            highest_uid = max(highest_uid, int(uid) if uid.isdigit() else highest_uid)
+            status_code, fetched = client.uid("fetch", uid, "(BODY.PEEK[] INTERNALDATE)")
+            if status_code != "OK":
+                continue
+            raw_email = next((item[1] for item in fetched if isinstance(item, tuple) and len(item) > 1 and isinstance(item[1], bytes)), None)
+            if not raw_email:
+                continue
+            message = BytesParser(policy=policy.default).parsebytes(raw_email)
+            recipients = clean_text(
+                " ".join(str(message.get_all(name, []) or "") for name in ("To", "Cc", "Delivered-To", "X-Original-To", "Envelope-To", "Apparently-To"))
+            ).lower()
+            matched = [row for email, row in by_email.items() if email and email in recipients]
+            if not matched:
+                continue
+            inspected += 1
+            for mailbox in matched:
+                new_row, archived_row, r2_row = _store_parsed_message(mailbox, uid, raw_email, message)
+                inserted += int(new_row)
+                archived += archived_row
+                r2_errors += r2_row
+        synced_at = now_iso()
+        with db() as conn:
+            conn.execute(
+                "UPDATE icloud_accounts SET imap_last_uid=?,imap_uid_validity=?,last_imap_sync_at=?,last_error='',updated_at=? WHERE id=?",
+                (highest_uid, uid_validity, synced_at, synced_at, account_id),
+            )
+            conn.execute(
+                "UPDATE mailboxes SET last_sync_at=?,last_error='',updated_at=? WHERE account_id=? AND active=1",
+                (synced_at, synced_at, account_id),
+            )
+        return {
+            "ok": True, "skipped": False, "account_id": account_id, "inspected": inspected,
+            "inserted": inserted, "r2_archived": archived, "r2_errors": r2_errors, "synced_at": synced_at,
+        }
+    except Exception as exc:
+        message = friendly_sync_error(exc)
+        stamp = now_iso()
+        with db() as conn:
+            conn.execute("UPDATE icloud_accounts SET last_error=?,updated_at=? WHERE id=?", (message, stamp, account_id))
+            conn.execute("UPDATE mailboxes SET last_error=?,updated_at=? WHERE account_id=? AND active=1", (message, stamp, account_id))
+        raise RuntimeError(message) from exc
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+            try:
+                client.logout()
+            except Exception:
+                pass
+        lock.release()
+
+
 def sync_mailbox(row: dict[str, Any]) -> dict[str, Any]:
+    if row.get("account_id"):
+        return sync_icloud_account(str(row["account_id"]))
     lock = sync_lock(row["id"])
     if not lock.acquire(blocking=False):
         return {"ok": True, "skipped": True, "reason": "sync already running"}
@@ -660,6 +1217,284 @@ def sync_mailbox(row: dict[str, Any]) -> dict[str, Any]:
             except Exception:
                 pass
         lock.release()
+
+
+def sync_icloud_account_addresses(account_id: str) -> dict[str, Any]:
+    account = get_icloud_account(account_id)
+    if account["status"] != "active":
+        raise RuntimeError("iCloud account is not active")
+    try:
+        cookie = FERNET.decrypt(account["cookie_ciphertext"].encode()).decode()
+    except (InvalidToken, UnicodeDecodeError) as exc:
+        raise RuntimeError("iCloud CK cannot be decrypted") from exc
+    try:
+        result = call_hme_bridge(
+            "list",
+            {
+                "cookie": cookie,
+                "region": account["region"],
+                "maildomainHost": account["maildomain_host"],
+            },
+        )
+    except Exception as exc:
+        stamp = now_iso()
+        with db() as conn:
+            conn.execute("UPDATE icloud_accounts SET last_error=?,updated_at=? WHERE id=?", (str(exc)[:500], stamp, account_id))
+        raise
+    addresses = [item for item in result.get("addresses", []) if item.get("active") is not False]
+    merged = upsert_hme_addresses(account_id, addresses, "synced")
+    returned_emails = {normalize_email(str(item.get("email") or "")) for item in addresses if item.get("email")}
+    mark_account_address_sync(account_id, returned_emails, str(result.get("maildomainHost") or ""))
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "synced": len(merged),
+        "created": sum(1 for item in merged if item["created"]),
+        "updated": sum(1 for item in merged if not item["created"]),
+        "maildomain_host": result.get("maildomainHost") or account["maildomain_host"],
+    }
+
+
+def save_icloud_account_imap(account_id: str, payload: ICloudAccountImapPayload) -> dict[str, Any]:
+    account = get_icloud_account(account_id)
+    email = normalize_email(payload.email)
+    if not valid_email(email):
+        raise HTTPException(400, "invalid primary iCloud mailbox")
+    host = payload.host.strip()
+    if not host or any(char.isspace() for char in host):
+        raise HTTPException(400, "invalid IMAP host")
+    mailbox = payload.mailbox.strip() or "INBOX"
+    encrypted = account["imap_credential_ciphertext"]
+    if payload.app_password:
+        encrypted = FERNET.encrypt(payload.app_password.encode()).decode("ascii")
+    if not encrypted:
+        raise HTTPException(400, "first IMAP configuration requires an App-specific password")
+    stamp = now_iso()
+    changed = (
+        account["imap_username"] != email
+        or account["imap_host"] != host
+        or int(account["imap_port"]) != int(payload.port)
+        or account["imap_mailbox"] != mailbox
+    )
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE icloud_accounts SET imap_username=?,imap_host=?,imap_port=?,imap_mailbox=?,
+              imap_credential_ciphertext=?,imap_last_uid=CASE WHEN ? THEN 0 ELSE imap_last_uid END,
+              imap_uid_validity=CASE WHEN ? THEN '' ELSE imap_uid_validity END,
+              imap_backfill_done=CASE WHEN ? THEN 0 ELSE imap_backfill_done END,last_error='',updated_at=? WHERE id=?
+            """,
+            (email, host, int(payload.port), mailbox, encrypted, int(changed), int(changed), int(changed), stamp, account_id),
+        )
+    return get_icloud_account(account_id)
+
+
+def account_label_sequence(account_id: str, prefix: str, count: int) -> list[str]:
+    if count < 1:
+        return []
+    with db() as conn:
+        account = conn.execute("SELECT label_sequence FROM icloud_accounts WHERE id=?", (account_id,)).fetchone()
+        if account is None:
+            raise HTTPException(404, "iCloud account not found")
+        start = int(account["label_sequence"] or 0) + 1
+        labels = [f"{prefix}-{start + index:03d}" for index in range(count)]
+        conn.execute(
+            "UPDATE icloud_accounts SET label_prefix=?,label_sequence=?,updated_at=? WHERE id=?",
+            (prefix, start + count - 1, now_iso(), account_id),
+        )
+    return labels
+
+
+def _generation_call(account: dict[str, Any], labels: list[str]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    try:
+        cookie = FERNET.decrypt(account["cookie_ciphertext"].encode()).decode()
+    except (InvalidToken, UnicodeDecodeError) as exc:
+        raise RuntimeError("iCloud CK cannot be decrypted") from exc
+    result = call_hme_bridge(
+        "generate",
+        {
+            "cookie": cookie,
+            "region": account["region"],
+            "maildomainHost": account["maildomain_host"],
+            "labels": labels,
+        },
+    )
+    return result, list(result.get("errors") or [])
+
+
+def _record_generation_results(job_id: str, generated: list[dict[str, Any]], errors: list[dict[str, Any]]) -> None:
+    with db() as conn:
+        for item in generated:
+            conn.execute(
+                "INSERT INTO generation_results(job_id,email,apple_label,status,error_text,created_at) VALUES(?,?,?,?,?,?)",
+                (job_id, normalize_email(str(item.get("email") or "")), str(item.get("label") or ""), "success", "", str(item.get("createdAt") or now_iso())[:64]),
+            )
+        for item in errors:
+            conn.execute(
+                "INSERT INTO generation_results(job_id,email,apple_label,status,error_text,created_at) VALUES(?,?,?,?,?,?)",
+                (job_id, "", str(item.get("label") or ""), "failed", str(item.get("error") or "generation failed")[:500], now_iso()),
+            )
+
+
+def create_generation_job_record(account_id: str, target_total: int, batch_size: int, label_prefix: str, status: str = "running") -> str:
+    job_id = uuid.uuid4().hex
+    stamp = now_iso()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO generation_jobs(id,account_id,target_total,batch_size,label_prefix,status,next_run_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?, ?,?)",
+            (job_id, account_id, target_total, batch_size, label_prefix, status, stamp, stamp, stamp),
+        )
+    return job_id
+
+
+def run_generation_batch(account_id: str, count: int, label_prefix: str, job_id: str) -> dict[str, Any]:
+    account = get_icloud_account(account_id)
+    if account["status"] != "active":
+        raise RuntimeError("iCloud account is not active")
+    cooldown = account.get("cooldown_until") or ""
+    if cooldown:
+        try:
+            if datetime.fromisoformat(cooldown).timestamp() > time.time():
+                raise HTTPException(409, "this iCloud account is in generation cooldown", headers={"X-Cooldown-Until": cooldown})
+        except ValueError:
+            pass
+    labels = account_label_sequence(account_id, label_prefix, count)
+    result, errors = _generation_call(account, labels)
+    generated = list(result.get("generated") or [])
+    merged = upsert_hme_addresses(account_id, generated, "generated")
+    _record_generation_results(job_id, generated, errors)
+    stamp = now_iso()
+    status = "success" if generated and not errors else "partial" if generated else "failed"
+    error_summary = "; ".join(str(item.get("error") or "") for item in errors)[:1000]
+    with db() as conn:
+        conn.execute(
+            "UPDATE generation_jobs SET status=?,generated_count=?,last_error=?,last_run_at=?,next_run_at='',updated_at=? WHERE id=?",
+            (status, len(generated), error_summary, stamp, stamp, job_id),
+        )
+        if generated:
+            cooldown_until = (datetime.now(timezone.utc) + timedelta(minutes=HME_GENERATION_COOLDOWN_MINUTES)).replace(microsecond=0).isoformat()
+            conn.execute(
+                "UPDATE icloud_accounts SET cooldown_until=?,maildomain_host=COALESCE(NULLIF(?,''),maildomain_host),last_error='',updated_at=? WHERE id=?",
+                (cooldown_until, str(result.get("maildomainHost") or ""), stamp, account_id),
+            )
+    return {"ok": True, "job_id": job_id, "status": status, "generated": generated, "errors": errors, "merged": merged}
+
+
+def create_generation_campaign(account_id: str, payload: ICloudCampaignPayload) -> dict[str, Any]:
+    account = get_icloud_account(account_id)
+    if account["status"] != "active":
+        raise HTTPException(409, "iCloud account is not active")
+    target_total = int(payload.target_total)
+    if target_total > HME_GENERATION_TARGET_MAX:
+        raise HTTPException(400, f"target total cannot exceed {HME_GENERATION_TARGET_MAX}")
+    batch_size = min(int(payload.batch_size), HME_GENERATION_BATCH_LIMIT)
+    prefix = normalize_label_prefix(payload.label_prefix, account["label_prefix"] or "icloud")
+    with db() as conn:
+        current = int(conn.execute("SELECT COUNT(*) FROM mailboxes WHERE account_id=? AND apple_active=1", (account_id,)).fetchone()[0])
+        open_job = conn.execute(
+            "SELECT id FROM generation_jobs WHERE account_id=? AND status IN ('queued','running') LIMIT 1",
+            (account_id,),
+        ).fetchone()
+        if open_job:
+            raise HTTPException(409, "this iCloud account already has an active generation campaign")
+        if current >= target_total:
+            raise HTTPException(400, f"account already has {current} active aliases")
+        job_id = uuid.uuid4().hex
+        stamp = now_iso()
+        conn.execute(
+            "INSERT INTO generation_jobs(id,account_id,target_total,batch_size,label_prefix,status,next_run_at,created_at,updated_at) VALUES(?,?,?,?,?,'running',?,?,?)",
+            (job_id, account_id, target_total, batch_size, prefix, stamp, stamp, stamp),
+        )
+    return get_generation_job(job_id)
+
+
+def get_generation_job(job_id: str) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT j.*,a.apple_id FROM generation_jobs j JOIN icloud_accounts a ON a.id=j.account_id WHERE j.id=?",
+            (job_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(404, "generation job not found")
+    return dict(row)
+
+
+def list_generation_jobs(account_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    with db() as conn:
+        if account_id:
+            rows = conn.execute(
+                "SELECT j.*,a.apple_id FROM generation_jobs j JOIN icloud_accounts a ON a.id=j.account_id WHERE j.account_id=? ORDER BY j.created_at DESC LIMIT ?",
+                (account_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT j.*,a.apple_id FROM generation_jobs j JOIN icloud_accounts a ON a.id=j.account_id ORDER BY j.created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def process_generation_jobs() -> list[dict[str, Any]]:
+    now = now_iso()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM generation_jobs WHERE status='running' AND (next_run_at='' OR next_run_at<=?) ORDER BY created_at LIMIT 10",
+            (now,),
+        ).fetchall()
+    results = []
+    for raw in rows:
+        job = dict(raw)
+        try:
+            account = get_icloud_account(job["account_id"])
+            with db() as conn:
+                current = int(conn.execute("SELECT COUNT(*) FROM mailboxes WHERE account_id=? AND apple_active=1", (job["account_id"],)).fetchone()[0])
+            if current >= int(job["target_total"]):
+                with db() as conn:
+                    conn.execute("UPDATE generation_jobs SET status='completed',next_run_at='',updated_at=? WHERE id=?", (now_iso(), job["id"]))
+                results.append({"job_id": job["id"], "status": "completed"})
+                continue
+            cooldown = account.get("cooldown_until") or ""
+            if cooldown:
+                try:
+                    if datetime.fromisoformat(cooldown).timestamp() > time.time():
+                        with db() as conn:
+                            conn.execute("UPDATE generation_jobs SET next_run_at=?,updated_at=? WHERE id=?", (cooldown, now_iso(), job["id"]))
+                        continue
+                except ValueError:
+                    pass
+            count = min(int(job["batch_size"]), int(job["target_total"]) - current)
+            labels = account_label_sequence(job["account_id"], job["label_prefix"], count)
+            generated_result, errors = _generation_call(account, labels)
+            generated = list(generated_result.get("generated") or [])
+            upsert_hme_addresses(job["account_id"], generated, "generated")
+            _record_generation_results(job["id"], generated, errors)
+            new_total = current + len(generated)
+            stamp = now_iso()
+            complete = new_total >= int(job["target_total"])
+            next_run = "" if complete else (
+                (datetime.now(timezone.utc) + timedelta(minutes=HME_GENERATION_COOLDOWN_MINUTES)).replace(microsecond=0).isoformat()
+                if generated else (datetime.now(timezone.utc) + timedelta(minutes=HME_GENERATION_RETRY_MINUTES)).replace(microsecond=0).isoformat()
+            )
+            with db() as conn:
+                conn.execute(
+                    "UPDATE generation_jobs SET status=?,generated_count=generated_count+?,last_error=?,last_run_at=?,next_run_at=?,updated_at=? WHERE id=?",
+                    ("completed" if complete else "running", len(generated), "; ".join(str(item.get("error") or "") for item in errors)[:1000], stamp, next_run, stamp, job["id"]),
+                )
+                if generated:
+                    cooldown_until = (datetime.now(timezone.utc) + timedelta(minutes=HME_GENERATION_COOLDOWN_MINUTES)).replace(microsecond=0).isoformat()
+                    conn.execute(
+                        "UPDATE icloud_accounts SET cooldown_until=?,maildomain_host=COALESCE(NULLIF(?,''),maildomain_host),last_error='',updated_at=? WHERE id=?",
+                        (cooldown_until, str(generated_result.get("maildomainHost") or ""), stamp, job["account_id"]),
+                    )
+            results.append({"job_id": job["id"], "generated": len(generated), "status": "completed" if complete else "running"})
+        except Exception as exc:
+            message = str(exc)[:1000]
+            next_run = (datetime.now(timezone.utc) + timedelta(minutes=HME_GENERATION_RETRY_MINUTES)).replace(microsecond=0).isoformat()
+            with db() as conn:
+                conn.execute("UPDATE generation_jobs SET last_error=?,next_run_at=?,updated_at=? WHERE id=?", (message, next_run, now_iso(), job["id"]))
+                conn.execute("UPDATE icloud_accounts SET last_error=?,updated_at=? WHERE id=?", (message, now_iso(), job["account_id"]))
+            results.append({"job_id": job["id"], "status": "waiting", "error": message})
+    return results
 
 
 def get_latest_code(row: dict[str, Any], after: int = 0) -> dict[str, Any]:
@@ -924,14 +1759,153 @@ def operator_overview(_operator: bool = Depends(require_operator)) -> dict[str, 
             "codes_24h": conn.execute("SELECT COUNT(*) FROM messages WHERE code!='' AND received_at>=?", (cutoff,)).fetchone()[0],
             "sync_errors": conn.execute("SELECT COUNT(*) FROM mailboxes WHERE active=1 AND last_error!=''").fetchone()[0],
             "public_links": conn.execute("SELECT COUNT(*) FROM public_access WHERE active=1").fetchone()[0],
+            "icloud_accounts": conn.execute("SELECT COUNT(*) FROM icloud_accounts WHERE status!='deleted'").fetchone()[0],
+        }
+        status_counts = {
+            status: int(conn.execute("SELECT COUNT(*) FROM mailboxes WHERE business_status=?", (status,)).fetchone()[0])
+            for status in BUSINESS_STATUSES
         }
     return {
         "ok": True,
         "counts": counts,
+        "status_counts": status_counts,
+        "mailbox_status_labels": BUSINESS_STATUS_LABELS,
         "r2_configured": R2_STORAGE.configured,
         "r2_required": R2_REQUIRED,
         "r2_usage": r2_usage_snapshot(),
     }
+
+
+@app.get("/api/v1/operator/icloud-accounts")
+def operator_icloud_accounts(_operator: bool = Depends(require_operator)) -> dict[str, Any]:
+    return {"ok": True, "accounts": [public_icloud_account(row) for row in account_summary_rows()]}
+
+
+@app.post("/api/v1/operator/icloud-accounts/import")
+def operator_import_icloud_account(payload: ICloudAccountImportPayload, request: Request, _operator: bool = Depends(require_operator)) -> dict[str, Any]:
+    try:
+        prepared = prepare_icloud_account(payload.cookie, payload.region)
+        account = upsert_icloud_account(prepared)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, str(exc)[:500]) from exc
+    audit(None, "operator.icloud_account.import", request)
+    summary = next((row for row in account_summary_rows() if row["id"] == account["id"]), account)
+    return {"ok": True, "account": public_icloud_account(summary)}
+
+
+@app.patch("/api/v1/operator/icloud-accounts/{account_id}/imap")
+def operator_configure_icloud_imap(
+    account_id: str,
+    payload: ICloudAccountImapPayload,
+    request: Request,
+    _operator: bool = Depends(require_operator),
+) -> dict[str, Any]:
+    account = save_icloud_account_imap(account_id, payload)
+    audit(None, "operator.icloud_account.imap.update", request)
+    summary = next((row for row in account_summary_rows() if row["id"] == account_id), account)
+    return {"ok": True, "account": public_icloud_account(summary)}
+
+
+@app.post("/api/v1/operator/icloud-accounts/{account_id}/sync")
+def operator_sync_icloud_addresses(account_id: str, request: Request, _operator: bool = Depends(require_operator)) -> dict[str, Any]:
+    get_icloud_account(account_id)
+    try:
+        result = sync_icloud_account_addresses(account_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, str(exc)[:500]) from exc
+    audit(None, "operator.icloud_account.addresses.sync", request)
+    return result
+
+
+@app.post("/api/v1/operator/icloud-accounts/{account_id}/generate")
+def operator_generate_icloud_addresses(
+    account_id: str,
+    payload: ICloudGenerationPayload,
+    request: Request,
+    _operator: bool = Depends(require_operator),
+) -> dict[str, Any]:
+    account = get_icloud_account(account_id)
+    prefix = normalize_label_prefix(payload.label_prefix, account["label_prefix"] or "icloud")
+    with db() as conn:
+        current = int(conn.execute("SELECT COUNT(*) FROM mailboxes WHERE account_id=? AND apple_active=1", (account_id,)).fetchone()[0])
+        open_job = conn.execute("SELECT id FROM generation_jobs WHERE account_id=? AND status IN ('queued','running') LIMIT 1", (account_id,)).fetchone()
+    if open_job:
+        raise HTTPException(409, "this iCloud account already has an active generation job")
+    job_id = create_generation_job_record(account_id, current + payload.count, payload.count, prefix)
+    try:
+        result = run_generation_batch(account_id, payload.count, prefix, job_id)
+    except HTTPException:
+        with db() as conn:
+            conn.execute("UPDATE generation_jobs SET status='failed',last_error=?,updated_at=? WHERE id=?", ("generation cooldown", now_iso(), job_id))
+        raise
+    except Exception as exc:
+        with db() as conn:
+            conn.execute("UPDATE generation_jobs SET status='failed',last_error=?,updated_at=? WHERE id=?", (str(exc)[:1000], now_iso(), job_id))
+        raise HTTPException(502, str(exc)[:500]) from exc
+    audit(None, "operator.icloud_account.addresses.generate", request)
+    return result
+
+
+@app.post("/api/v1/operator/icloud-accounts/{account_id}/generation-campaigns")
+def operator_create_generation_campaign(
+    account_id: str,
+    payload: ICloudCampaignPayload,
+    request: Request,
+    _operator: bool = Depends(require_operator),
+) -> dict[str, Any]:
+    try:
+        job = create_generation_campaign(account_id, payload)
+    except HTTPException:
+        raise
+    audit(None, "operator.icloud_account.generation_campaign.create", request)
+    return {"ok": True, "job": job}
+
+
+@app.get("/api/v1/operator/generation-jobs")
+def operator_generation_jobs(account_id: str = Query("", max_length=64), _operator: bool = Depends(require_operator)) -> dict[str, Any]:
+    return {"ok": True, "jobs": list_generation_jobs(account_id or None)}
+
+
+@app.post("/api/v1/operator/generation-jobs/{job_id}/stop")
+def operator_stop_generation_job(job_id: str, request: Request, _operator: bool = Depends(require_operator)) -> dict[str, Any]:
+    job = get_generation_job(job_id)
+    with db() as conn:
+        changed = conn.execute("UPDATE generation_jobs SET status='stopped',next_run_at='',updated_at=? WHERE id=? AND status='running'", (now_iso(), job_id)).rowcount
+    if not changed:
+        raise HTTPException(409, "generation job is not running")
+    audit(None, "operator.generation_job.stop", request)
+    return {"ok": True, "job": get_generation_job(job_id)}
+
+
+@app.post("/api/v1/operator/generation-jobs/{job_id}/resume")
+def operator_resume_generation_job(job_id: str, request: Request, _operator: bool = Depends(require_operator)) -> dict[str, Any]:
+    job = get_generation_job(job_id)
+    if job["status"] not in {"stopped", "failed"}:
+        raise HTTPException(409, "only stopped or failed generation jobs can be resumed")
+    with db() as conn:
+        open_job = conn.execute("SELECT id FROM generation_jobs WHERE account_id=? AND status='running' AND id!=? LIMIT 1", (job["account_id"], job_id)).fetchone()
+        if open_job:
+            raise HTTPException(409, "this iCloud account already has another running generation job")
+        conn.execute("UPDATE generation_jobs SET status='running',next_run_at='',updated_at=? WHERE id=?", (now_iso(), job_id))
+    audit(None, "operator.generation_job.resume", request)
+    return {"ok": True, "job": get_generation_job(job_id)}
+
+
+@app.delete("/api/v1/operator/icloud-accounts/{account_id}")
+def operator_delete_icloud_account(account_id: str, request: Request, _operator: bool = Depends(require_operator)) -> dict[str, Any]:
+    get_icloud_account(account_id)
+    with db() as conn:
+        conn.execute(
+            "UPDATE icloud_accounts SET status='deleted',cookie_ciphertext='',imap_credential_ciphertext='',last_error='',updated_at=? WHERE id=?",
+            (now_iso(), account_id),
+        )
+        conn.execute("UPDATE generation_jobs SET status='stopped',next_run_at='' WHERE account_id=? AND status='running'", (account_id,))
+    audit(None, "operator.icloud_account.delete", request)
+    return {"ok": True}
 
 
 @app.post("/api/v1/operator/tenants")
@@ -1010,11 +1984,13 @@ def operator_mailbox_row(mailbox_id: str, active_only: bool = True) -> dict[str,
         row = conn.execute(
             f"""
             SELECT m.*,t.email AS tenant_email,t.active AS tenant_active,
+              a.apple_id AS account_apple_id,a.display_name AS account_display_name,
               CASE WHEN p.active=1 THEN 1 ELSE 0 END AS public_access_enabled,
               (SELECT x.code FROM messages x WHERE x.mailbox_id=m.id AND x.code!='' ORDER BY datetime(x.received_at) DESC,x.id DESC LIMIT 1) AS latest_code,
               (SELECT x.received_at FROM messages x WHERE x.mailbox_id=m.id AND x.code!='' ORDER BY datetime(x.received_at) DESC,x.id DESC LIMIT 1) AS latest_code_at,
-              (SELECT COUNT(*) FROM messages x WHERE x.mailbox_id=m.id) AS message_count
+            (SELECT COUNT(*) FROM messages x WHERE x.mailbox_id=m.id) AS message_count
             FROM mailboxes m JOIN tenants t ON t.id=m.tenant_id
+              LEFT JOIN icloud_accounts a ON a.id=m.account_id
               LEFT JOIN public_access p ON p.mailbox_id=m.id
             WHERE m.id=?{condition}
             """,
@@ -1029,28 +2005,124 @@ def operator_mailbox_row(mailbox_id: str, active_only: bool = True) -> dict[str,
 def operator_mailboxes(
     search: str = Query("", max_length=100),
     tenant_id: str = Query("", max_length=64),
+    account_id: str = Query("", max_length=64),
+    status: str = Query("", max_length=32),
+    has_code: bool | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=10, le=100),
+    sort: str = Query("updated", max_length=20),
     include_inactive: bool = Query(False),
     _operator: bool = Depends(require_operator),
 ) -> dict[str, Any]:
-    term = f"%{search.strip()}%"
-    active_clause = "" if include_inactive else " AND m.active=1"
+    where = ["1=1"]
+    values: list[Any] = []
+    if not include_inactive:
+        where.append("m.active=1")
+    if tenant_id.strip():
+        where.append("m.tenant_id=?")
+        values.append(tenant_id.strip())
+    if account_id.strip():
+        where.append("m.account_id=?")
+        values.append(account_id.strip())
+    if status.strip():
+        normalized_status = validate_business_status(status)
+        where.append("m.business_status=?")
+        values.append(normalized_status)
+    if has_code is True:
+        where.append("EXISTS(SELECT 1 FROM messages hc WHERE hc.mailbox_id=m.id AND hc.code!='')")
+    elif has_code is False:
+        where.append("NOT EXISTS(SELECT 1 FROM messages hc WHERE hc.mailbox_id=m.id AND hc.code!='')")
+    if search.strip():
+        term = f"%{search.strip()}%"
+        where.append("(m.email LIKE ? OR m.label LIKE ? OR m.apple_label LIKE ? OR m.customer_id LIKE ? OR m.order_no LIKE ? OR t.email LIKE ? OR a.apple_id LIKE ?)")
+        values.extend([term] * 7)
+    clause = " AND ".join(where)
+    order_by = {
+        "created": "m.created_at DESC",
+        "email": "m.email COLLATE NOCASE ASC",
+        "status": "m.business_status ASC,m.updated_at DESC",
+        "code": "latest_code_at DESC,m.updated_at DESC",
+        "updated": "m.updated_at DESC",
+    }.get(sort, "m.updated_at DESC")
     with db() as conn:
+        total = int(conn.execute(
+            f"SELECT COUNT(*) FROM mailboxes m JOIN tenants t ON t.id=m.tenant_id LEFT JOIN icloud_accounts a ON a.id=m.account_id WHERE {clause}",
+            tuple(values),
+        ).fetchone()[0])
         rows = conn.execute(
             f"""
-            SELECT m.id,m.tenant_id,m.email,m.imap_username,m.label,m.active,m.last_sync_at,m.last_error,m.created_at,m.updated_at,
-              t.email AS tenant_email,t.active AS tenant_active,
+            SELECT m.*,t.email AS tenant_email,t.active AS tenant_active,
+              a.apple_id AS account_apple_id,a.display_name AS account_display_name,
               CASE WHEN p.active=1 THEN 1 ELSE 0 END AS public_access_enabled,
               (SELECT x.code FROM messages x WHERE x.mailbox_id=m.id AND x.code!='' ORDER BY datetime(x.received_at) DESC,x.id DESC LIMIT 1) AS latest_code,
               (SELECT x.received_at FROM messages x WHERE x.mailbox_id=m.id AND x.code!='' ORDER BY datetime(x.received_at) DESC,x.id DESC LIMIT 1) AS latest_code_at,
               (SELECT COUNT(*) FROM messages x WHERE x.mailbox_id=m.id) AS message_count
             FROM mailboxes m JOIN tenants t ON t.id=m.tenant_id
+              LEFT JOIN icloud_accounts a ON a.id=m.account_id
               LEFT JOIN public_access p ON p.mailbox_id=m.id
-            WHERE (?='' OR m.tenant_id=?) AND (m.email LIKE ? OR m.label LIKE ? OR t.email LIKE ?){active_clause}
-            ORDER BY m.created_at DESC LIMIT 500
+            WHERE {clause}
+            ORDER BY {order_by} LIMIT ? OFFSET ?
             """,
-            (tenant_id.strip(), tenant_id.strip(), term, term, term),
+            (*values, page_size, (page - 1) * page_size),
         ).fetchall()
-    return {"ok": True, "mailboxes": [operator_public_mailbox(dict(row)) for row in rows]}
+        status_rows = conn.execute(
+            f"SELECT m.business_status,COUNT(*) AS count FROM mailboxes m JOIN tenants t ON t.id=m.tenant_id LEFT JOIN icloud_accounts a ON a.id=m.account_id WHERE {clause} GROUP BY m.business_status",
+            tuple(values),
+        ).fetchall()
+    status_counts = {status_name: 0 for status_name in BUSINESS_STATUSES}
+    status_counts.update({str(row["business_status"]): int(row["count"]) for row in status_rows})
+    return {
+        "ok": True,
+        "mailboxes": [operator_public_mailbox(dict(row)) for row in rows],
+        "pagination": {"page": page, "page_size": page_size, "total": total, "total_pages": max(1, (total + page_size - 1) // page_size)},
+        "status_counts": status_counts,
+    }
+
+
+@app.get("/api/v1/operator/mailboxes/export")
+def operator_export_mailboxes(
+    search: str = Query("", max_length=100),
+    account_id: str = Query("", max_length=64),
+    status: str = Query("", max_length=32),
+    include_inactive: bool = Query(False),
+    _operator: bool = Depends(require_operator),
+) -> PlainTextResponse:
+    where = ["1=1"]
+    values: list[Any] = []
+    if not include_inactive:
+        where.append("m.active=1")
+    if account_id.strip():
+        where.append("m.account_id=?")
+        values.append(account_id.strip())
+    if status.strip():
+        where.append("m.business_status=?")
+        values.append(validate_business_status(status))
+    if search.strip():
+        term = f"%{search.strip()}%"
+        where.append("(m.email LIKE ? OR m.label LIKE ? OR m.apple_label LIKE ? OR m.customer_id LIKE ? OR m.order_no LIKE ? OR a.apple_id LIKE ?)")
+        values.extend([term] * 6)
+    clause = " AND ".join(where)
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT m.email,m.apple_label,m.business_status,m.customer_id,m.order_no,m.source,
+              a.apple_id,m.created_at,m.updated_at,m.last_sync_at,m.last_error
+            FROM mailboxes m LEFT JOIN icloud_accounts a ON a.id=m.account_id
+            WHERE {clause} ORDER BY m.updated_at DESC LIMIT 10000
+            """,
+            tuple(values),
+        ).fetchall()
+    def csv_cell(value: Any) -> str:
+        return '"' + str(value or "").replace('"', '""') + '"'
+    header = ["邮箱", "Apple标签", "业务状态", "客户", "订单号", "来源", "iCloud账号", "创建时间", "更新时间", "最近同步", "同步错误"]
+    lines = [",".join(csv_cell(item) for item in header)]
+    for row in rows:
+        lines.append(",".join(csv_cell(value) for value in (
+            row["email"], row["apple_label"], BUSINESS_STATUS_LABELS.get(row["business_status"], row["business_status"]),
+            row["customer_id"], row["order_no"], row["source"], row["apple_id"], row["created_at"],
+            row["updated_at"], row["last_sync_at"], row["last_error"],
+        )))
+    return PlainTextResponse("\ufeff" + "\r\n".join(lines), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=icloud-mailboxes.csv"})
 
 
 def operator_public_mailbox(row: dict[str, Any]) -> dict[str, Any]:
@@ -1060,7 +2132,16 @@ def operator_public_mailbox(row: dict[str, Any]) -> dict[str, Any]:
         "tenant_email": INVENTORY_TENANT_DISPLAY if unassigned else row.get("tenant_email", ""),
         "tenant_unassigned": unassigned,
         "imap_username": row.get("imap_username") or "",
-        "email": row["email"], "label": row["label"], "active": bool(row["active"]),
+        "email": row["email"], "label": row["label"], "apple_label": row.get("apple_label") or "",
+        "account_id": row.get("account_id"), "business_status": row.get("business_status") or "inventory",
+        "business_status_label": BUSINESS_STATUS_LABELS.get(row.get("business_status"), "库存中"),
+        "account_apple_id": row.get("account_apple_id") or "",
+        "account_display_name": row.get("account_display_name") or "",
+        "apple_active": bool(row.get("apple_active", True)), "source": row.get("source") or "manual",
+        "customer_id": row.get("customer_id") or "", "order_no": row.get("order_no") or "",
+        "sold_at": row.get("sold_at") or None, "used_at": row.get("used_at") or None,
+        "membership_at": row.get("membership_at") or None, "note": row.get("note") or "",
+        "active": bool(row["active"]),
         "tenant_active": bool(row.get("tenant_active", True)),
         "last_sync_at": row["last_sync_at"] or None, "last_error": row["last_error"] or None,
         "created_at": row["created_at"], "updated_at": row["updated_at"],
@@ -1137,6 +2218,71 @@ def operator_update_mailbox_credentials(
         )
     audit(row["tenant_id"], "operator.mailbox.credentials.update", request, mailbox_id)
     return {"ok": True, "mailbox": operator_public_mailbox(operator_mailbox_row(mailbox_id, active_only=False))}
+
+
+def business_update_values(row: dict[str, Any], payload: BusinessStatusPayload | BusinessStatusBatchPayload, stamp: str) -> tuple[Any, ...]:
+    status = validate_business_status(payload.status)
+    customer_id = row.get("customer_id") or "" if payload.customer_id is None else payload.customer_id.strip()
+    order_no = row.get("order_no") or "" if payload.order_no is None else payload.order_no.strip()
+    note = row.get("note") or "" if payload.note is None else payload.note.strip()
+    sold_at = row.get("sold_at") or ""
+    used_at = row.get("used_at") or ""
+    membership_at = row.get("membership_at") or ""
+    if status == "inventory":
+        customer_id, order_no, sold_at, used_at, membership_at = "", "", "", "", ""
+    elif status == "sold" and not sold_at:
+        sold_at = stamp
+    elif status in {"self_member", "self_no_member"} and not used_at:
+        used_at = stamp
+    if status == "self_member" and not membership_at:
+        membership_at = stamp
+    if status == "self_no_member":
+        membership_at = ""
+    return status, customer_id[:64], order_no[:128], sold_at, used_at, membership_at, note[:1000]
+
+
+@app.patch("/api/v1/operator/mailboxes/{mailbox_id}/business")
+def operator_update_mailbox_business(
+    mailbox_id: str,
+    payload: BusinessStatusPayload,
+    request: Request,
+    _operator: bool = Depends(require_operator),
+) -> dict[str, Any]:
+    row = operator_mailbox_row(mailbox_id, active_only=False)
+    values = business_update_values(row, payload, now_iso())
+    with db() as conn:
+        conn.execute(
+            "UPDATE mailboxes SET business_status=?,customer_id=?,order_no=?,sold_at=?,used_at=?,membership_at=?,note=?,updated_at=? WHERE id=?",
+            (*values, now_iso(), mailbox_id),
+        )
+    audit(row["tenant_id"], f"operator.mailbox.business.{values[0]}", request, mailbox_id)
+    return {"ok": True, "mailbox": operator_public_mailbox(operator_mailbox_row(mailbox_id, active_only=False))}
+
+
+@app.patch("/api/v1/operator/mailboxes/batch-business")
+def operator_batch_mailbox_business(
+    payload: BusinessStatusBatchPayload,
+    request: Request,
+    _operator: bool = Depends(require_operator),
+) -> dict[str, Any]:
+    ids = list(dict.fromkeys(str(item).strip() for item in payload.ids if str(item).strip()))[:500]
+    if not ids:
+        raise HTTPException(400, "select at least one mailbox")
+    validate_business_status(payload.status)
+    placeholders = ",".join("?" for _ in ids)
+    stamp = now_iso()
+    changed = 0
+    with db() as conn:
+        rows = [dict(row) for row in conn.execute(f"SELECT * FROM mailboxes WHERE id IN ({placeholders})", tuple(ids)).fetchall()]
+        statement = conn.execute
+        for row in rows:
+            values = business_update_values(row, payload, stamp)
+            changed += statement(
+                "UPDATE mailboxes SET business_status=?,customer_id=?,order_no=?,sold_at=?,used_at=?,membership_at=?,note=?,updated_at=? WHERE id=?",
+                (*values, stamp, row["id"]),
+            ).rowcount
+    audit(None, f"operator.mailbox.business.batch.{payload.status}", request)
+    return {"ok": True, "updated": changed, "status": payload.status}
 
 
 @app.post("/api/v1/operator/mailboxes/{mailbox_id}/public-access")
@@ -1423,14 +2569,36 @@ def _load_ui_override(filename: str, fallback: str) -> str:
 
 PUBLIC_VIEWER_HTML = _load_ui_override("platform_viewer.html", PUBLIC_VIEWER_HTML)
 ADMIN_HTML = _load_ui_override("platform_admin.html", ADMIN_HTML)
+OPERATOR_CSS = _load_ui_override("operator.css", "")
+OPERATOR_JS = _load_ui_override("operator.js", "")
+
+
+@app.get("/operator.css", response_class=PlainTextResponse)
+def operator_css() -> PlainTextResponse:
+    return PlainTextResponse(OPERATOR_CSS, media_type="text/css")
+
+
+@app.get("/operator.js", response_class=PlainTextResponse)
+def operator_js() -> PlainTextResponse:
+    return PlainTextResponse(OPERATOR_JS, media_type="application/javascript")
 
 
 def sync_all_mailboxes() -> list[dict[str, Any]]:
     with db() as conn:
+        accounts = conn.execute(
+            "SELECT id FROM icloud_accounts WHERE status='active' AND imap_username!='' AND imap_credential_ciphertext!='' ORDER BY created_at"
+        ).fetchall()
         rows = conn.execute(
-            "SELECT m.* FROM mailboxes m JOIN tenants t ON t.id=m.tenant_id WHERE m.active=1 AND t.active=1 ORDER BY m.created_at"
+            "SELECT m.* FROM mailboxes m JOIN tenants t ON t.id=m.tenant_id WHERE m.active=1 AND t.active=1 AND m.account_id IS NULL ORDER BY m.created_at"
         ).fetchall()
     result = []
+    for account in accounts:
+        account_id = str(account["id"])
+        try:
+            value = sync_icloud_account(account_id)
+        except Exception as exc:
+            value = {"ok": False, "error": clean_text(str(exc))[:300]}
+        result.append({"account_id": account_id, **value})
     for raw in rows:
         row = dict(raw)
         try:
