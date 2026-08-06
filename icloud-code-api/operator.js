@@ -29,6 +29,14 @@ const api = async (path, options={}) => {
 };
 const statusOptions = (first="全部状态") => `<option value="">${first}</option>` + Object.entries(statusLabels).map(([key,label]) => `<option value="${key}">${label}</option>`).join("");
 const accountOptions = () => `<option value="">全部 iCloud 账号</option>` + accounts.map(a => `<option value="${safe(a.id)}">${safe(a.apple_id || a.display_name || a.id)}</option>`).join("");
+const compactICloudCurl = value => {
+  const text = String(value || "").trim();
+  if (!/\bcurl(?:\.exe)?\s/i.test(text)) return text;
+  const normalized = text.replace(/(?:\\|\^)\s*\r?\n/g, " ");
+  const blocks = normalized.split(/(?=\bcurl(?:\.exe)?\s)/i).filter(Boolean);
+  const hme = blocks.filter(block => /p\d+-maildomainws\.icloud\.com(?:\.cn)?/i.test(block) && /\/v[12]\/hme\//i.test(block));
+  return (hme.length ? hme[hme.length - 1] : blocks[blocks.length - 1] || text).trim();
+};
 
 function closeModal() { $("modalRoot").className = "hidden"; $("modalRoot").textContent = ""; }
 function openModal(title, body, submitLabel, submit) {
@@ -130,7 +138,7 @@ async function loadAccounts() {
   });
 }
 function openImportModal() {
-  openModal("导入 iCloud CK 账号",`<p class="muted">粘贴 new-icloud 支持的完整 cURL、Cookie 文本或 CK。系统会先校验账号，再保存加密 CK。</p><div class="form-grid"><label>CK / cURL<textarea data-cookie placeholder="粘贴完整 Cookie 或 Copy as cURL 内容"></textarea></label><label>区域<select data-region><option value="auto">自动检测</option><option value="global">全球</option><option value="china">中国区</option></select></label><div data-error class="error"></div></div><div class="form-actions"><button data-submit class="button primary"></button></div>`,"校验并导入",async box=>{const x=await api("/api/v1/operator/icloud-accounts/import",{method:"POST",body:JSON.stringify({cookie:box.querySelector("[data-cookie]").value,region:box.querySelector("[data-region]").value})});closeModal();showToast("账号已导入："+(x.account.apple_id||"成功"));loadAccounts();});
+  openModal("导入 iCloud CK 账号",`<p class="muted">粘贴 new-icloud 支持的完整 cURL、Cookie 文本或 CK。系统会先校验账号，再保存加密 CK。</p><div class="form-grid"><label>CK / cURL<textarea data-cookie placeholder="粘贴完整 Cookie 或 Copy as cURL 内容"></textarea></label><label>区域<select data-region><option value="auto">自动检测</option><option value="global">全球</option><option value="china">中国区</option></select></label><div data-error class="error"></div></div><div class="form-actions"><button data-submit class="button primary"></button></div>`,"校验并导入",async box=>{const x=await api("/api/v1/operator/icloud-accounts/import",{method:"POST",body:JSON.stringify({cookie:compactICloudCurl(box.querySelector("[data-cookie]").value),region:box.querySelector("[data-region]").value})});closeModal();showToast("账号已导入："+(x.account.apple_id||"成功"));loadAccounts();});
 }
 function openImapModal(account) {
   openModal("配置账号级 IMAP",`<p class="muted">同一 Apple 账号下的隐藏邮箱共享一个主 iCloud IMAP 连接。</p><div class="form-grid"><label>主 iCloud 邮箱<input data-email class="input" value="${safe(account.imap_username)}" placeholder="name@icloud.com"></label><label>App 专用密码<input data-password class="input" type="password" placeholder="首次配置必填，留空保留原密码"></label><label>IMAP 主机<input data-host class="input" value="${safe(account.imap_host||"imap.mail.me.com")}"></label><label>端口<input data-port class="input" type="number" value="${account.imap_port||993}"></label><label>文件夹<input data-mailbox class="input" value="${safe(account.imap_mailbox||"INBOX")}"></label><div data-error class="error"></div></div><div class="form-actions"><button data-submit class="button primary"></button></div>`,"保存配置",async box=>{await api(`/api/v1/operator/icloud-accounts/${account.id}/imap`,{method:"PATCH",body:JSON.stringify({email:box.querySelector("[data-email]").value,app_password:box.querySelector("[data-password]").value||null,host:box.querySelector("[data-host]").value,port:Number(box.querySelector("[data-port]").value),mailbox:box.querySelector("[data-mailbox]").value})});closeModal();showToast("IMAP 配置已保存");loadAccounts();});

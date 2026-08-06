@@ -1,5 +1,6 @@
 import asyncio
 import aiohttp
+import json
 import os
 import ssl
 import certifi
@@ -8,6 +9,28 @@ import uuid
 
 REQUEST_TIMEOUT_SECONDS = 30
 REQUEST_RETRIES = 2
+
+
+def _decode_json_response(text: str) -> dict:
+    """Decode normal JSON and the anti-XSSI-wrapped JSON used by some Apple edges."""
+    payload = str(text or "").lstrip("\ufeff\r\n\t ")
+    for prefix in (")]}'", "while(1);", "for(;;);"):
+        if payload.startswith(prefix):
+            payload = payload[len(prefix):].lstrip("\r\n\t ")
+            break
+    try:
+        value = json.loads(payload)
+        return value if isinstance(value, dict) else {"result": value}
+    except json.JSONDecodeError as first_error:
+        # A proxy may prepend a short JavaScript guard. Recover only when a
+        # complete JSON object/array follows; never attempt to evaluate code.
+        starts = [index for index in (payload.find("{"), payload.find("[")) if index >= 0]
+        if starts:
+            value, end = json.JSONDecoder().raw_decode(payload[min(starts):])
+            trailing = payload[min(starts) + end:].strip()
+            if not trailing or trailing == ";":
+                return value if isinstance(value, dict) else {"result": value}
+        raise first_error
 
 
 class HideMyEmail:
@@ -108,15 +131,29 @@ class HideMyEmail:
         self.__cookies = cookies.strip()
 
     async def _request_json(self, method: str, url: str, **kwargs) -> dict:
+        response_status = 0
+        response_size = 0
         for attempt in range(REQUEST_RETRIES):
             try:
                 async with self.s.request(method, url, **kwargs) as resp:
-                    return await resp.json()
+                    response_status = resp.status
+                    body = await resp.text()
+                    response_size = len(body)
+                    return _decode_json_response(body)
             except asyncio.TimeoutError:
                 if attempt == REQUEST_RETRIES - 1:
                     return {
                         "error": 1,
                         "reason": f"Request timed out after {REQUEST_TIMEOUT_SECONDS}s",
+                    }
+            except json.JSONDecodeError as exc:
+                if attempt == REQUEST_RETRIES - 1:
+                    return {
+                        "error": 1,
+                        "reason": (
+                            "Apple returned invalid JSON "
+                            f"(HTTP {response_status}, {response_size} bytes, response position {exc.pos})"
+                        ),
                     }
             except Exception as e:
                 if attempt == REQUEST_RETRIES - 1:
