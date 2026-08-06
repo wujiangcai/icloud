@@ -1,7 +1,9 @@
 import asyncio
 import aiohttp
+import os
 import ssl
 import certifi
+import uuid
 
 
 REQUEST_TIMEOUT_SECONDS = 30
@@ -20,14 +22,25 @@ class HideMyEmail:
         },
     }
     params = {
-        "clientBuildNumber": "2536Project32",
-        "clientMasteringNumber": "2536B20",
+        # Keep these overridable because Apple changes the web build periodically.
+        "clientBuildNumber": os.environ.get("HIDEMYEMAIL_CLIENT_BUILD_NUMBER", "2628Build27"),
+        "clientMasteringNumber": os.environ.get(
+            "HIDEMYEMAIL_CLIENT_MASTERING_NUMBER",
+            os.environ.get("HIDEMYEMAIL_CLIENT_BUILD_NUMBER", "2628Build27"),
+        ),
         "clientId": "",
         "dsid": "",  # Directory Services Identifier (DSID) is a method of identifying AppleID accounts
     }
 
     def __init__(
-        self, cookies: str = "", region: str = "global", maildomain_host: str = ""
+        self,
+        cookies: str = "",
+        region: str = "global",
+        maildomain_host: str = "",
+        dsid: str = "",
+        client_id: str = "",
+        client_build_number: str = "",
+        client_mastering_number: str = "",
     ):
         """Initializes the HideMyEmail class.
 
@@ -44,6 +57,13 @@ class HideMyEmail:
         self.base_url_v2 = f"https://{resolved_maildomain_host}/v2/hme"
         self.web_origin = config["web_origin"]
         self.cookies = cookies
+        self.params = dict(type(self).params)
+        self.params["clientId"] = str(client_id or uuid.uuid4())
+        self.params["dsid"] = str(dsid or "")
+        if client_build_number:
+            self.params["clientBuildNumber"] = str(client_build_number)
+        if client_mastering_number:
+            self.params["clientMasteringNumber"] = str(client_mastering_number)
 
     async def __aenter__(self):
         connector = aiohttp.TCPConnector(

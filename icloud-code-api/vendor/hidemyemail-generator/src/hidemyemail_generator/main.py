@@ -7,6 +7,7 @@ import sys
 from typing import Union, List, Optional
 import re
 import ssl
+import uuid
 from pathlib import Path
 
 import aiohttp
@@ -135,7 +136,10 @@ async def fetch_account_info(cookie_file: str, region: str) -> dict:
 
 
 async def fetch_account_info_from_cookie(
-    cookie: str, region: str, maildomain_host: str = ""
+    cookie: str,
+    region: str,
+    maildomain_host: str = "",
+    request_params: Optional[dict] = None,
 ) -> dict:
     headers = {
         "Cookie": cookie,
@@ -148,12 +152,26 @@ async def fetch_account_info_from_cookie(
         ssl_context=ssl.create_default_context(cafile=certifi.where())
     )
 
+    validate_params = {
+        "clientBuildNumber": os.environ.get("HIDEMYEMAIL_CLIENT_BUILD_NUMBER", "2628Build27"),
+        "clientMasteringNumber": os.environ.get(
+            "HIDEMYEMAIL_CLIENT_MASTERING_NUMBER",
+            os.environ.get("HIDEMYEMAIL_CLIENT_BUILD_NUMBER", "2628Build27"),
+        ),
+        "clientId": str(uuid.uuid4()),
+        "requestId": str(uuid.uuid4()),
+    }
+    for key in validate_params:
+        value = str((request_params or {}).get(key) or "").strip()
+        if value:
+            validate_params[key] = value
+
     async with aiohttp.ClientSession(
         headers=headers,
         timeout=aiohttp.ClientTimeout(total=30),
         connector=connector,
     ) as session:
-        async with session.get(SETUP_VALIDATE_URLS[region]) as response:
+        async with session.post(SETUP_VALIDATE_URLS[region], params=validate_params, data=b"") as response:
             try:
                 data = await response.json(content_type=None)
             except Exception:

@@ -1,4 +1,4 @@
-"""Node.js 与 hidemyemail-generator 之间的 JSON 标准输入桥接层。"""
+"""JSON bridge between the platform and the vendored Hide My Email client."""
 
 import asyncio
 import base64
@@ -16,44 +16,203 @@ from hidemyemail_generator.hidemyemail import HideMyEmail  # noqa: E402
 from hidemyemail_generator.main import fetch_account_info_from_cookie  # noqa: E402
 
 
-def parse_cookie_context(content: str, requested_region: str = "auto") -> tuple[str, str, str]:
-    """在内存中解析原始 Cookie、cURL 或上游 Cookie 文件。"""
-    text = str(content or "").strip()
-    normalized = re.sub(r"(?:\\|\^)\s*\r?\n", " ", text)
-    region_match = re.search(r"(?m)^HIDEMYEMAIL_REGION=(global|china)\s*$", text)
-    region = region_match.group(1) if region_match else requested_region
-    host_match = re.search(r"(?m)^HIDEMYEMAIL_MAILDOMAIN_HOST=([^\s]+)\s*$", text)
-    maildomain_host = host_match.group(1).strip() if host_match else ""
-    encoded = re.search(r"(?m)^HIDEMYEMAIL_COOKIE_BASE64=([A-Za-z0-9+/=]+)\s*$", text)
-    if encoded:
-        return base64.b64decode(encoded.group(1)).decode("utf-8").strip(), region, maildomain_host
-    cookie_arg = re.search(r"(?:^|\s)(?:-b|--cookie)\s+(?:\^?\"|')(.+?)(?:\^?\"|')(?=\s+-|\s*$)", normalized, re.I | re.S)
-    if cookie_arg:
-        return cookie_arg.group(1).replace('^\"', '"').replace('\\"', '"').strip(), region, maildomain_host
-    header_arg = re.search(r"(?:-H|--header)\s+\^?(['\"])\s*cookie\s*:\s*(.*?)\^?\1", normalized, re.I | re.S)
-    if header_arg:
-        return header_arg.group(2).strip(), region, maildomain_host
-    header = re.search(r"^\s*cookie\s*:\s*(.+?)\s*$", normalized, re.I | re.S)
+MAILDOMAIN_HOST_RE = re.compile(
+    r"(?i)(?<![a-z0-9-])(p\d+-maildomainws\.icloud\.com(?:\.cn)?)(?![a-z0-9.-])"
+)
+MAILDOMAIN_HOST_FULL_RE = re.compile(
+    r"(?i)^p\d+-maildomainws\.icloud\.com(?:\.cn)?$"
+)
+
+
+def _normalize_maildomain_host(value: str) -> str:
+    host = str(value or "").strip().strip("'\"").lower()
+    if host.startswith("https://"):
+        host = host[8:]
+    elif host.startswith("http://"):
+        host = host[7:]
+    host = host.split("/", 1)[0].split("?", 1)[0].strip()
+    return host if MAILDOMAIN_HOST_FULL_RE.fullmatch(host) else ""
+
+
+def _region_for_maildomain_host(host: str) -> str:
+    return "china" if str(host or "").lower().endswith(".icloud.com.cn") else "global"
+
+
+def _host_for_partition(user_partition: str, region: str) -> str:
+    partition = re.fullmatch(r"\d+", str(user_partition or "").strip())
+    if not partition or region not in {"global", "china"}:
+        return ""
+    suffix = "com.cn" if region == "china" else "com"
+    return f"p{partition.group(0)}-maildomainws.icloud.{suffix}"
+
+
+def _host_matches_region(host: str, region: str) -> bool:
+    return bool(host and region in {"global", "china"} and _region_for_maildomain_host(host) == region)
+
+
+def _normalize_curl_text(text: str) -> str:
+    return re.sub(r"(?:\\|\^)\s*\r?\n", " ", text).replace("^\"", '\"').replace("^'", "'")
+
+
+def _curl_blocks(normalized: str) -> list[str]:
+    blocks = re.split(r"(?i)(?=\bcurl(?:\.exe)?\s)", normalized)
+    return [block for block in blocks if block.strip()] or [normalized]
+
+
+def _read_shell_argument(text: str, start: int) -> str:
+    value = text[start:].lstrip()
+    if value.startswith("^") and len(value) > 1 and value[1] in "'\"":
+        value = value[1:]
+    if not value:
+        return ""
+    quote = value[0] if value[0] in "'\"" else ""
+    if not quote:
+        return value.split(None, 1)[0].rstrip(";")
+    escaped = False
+    for index in range(1, len(value)):
+        char = value[index]
+        if quote == '"' and char == "\\" and not escaped:
+            escaped = True
+            continue
+        if char == quote and not escaped:
+            raw = value[1:index]
+            return raw.replace('^\\^"', '"').replace('\\"', '"').replace('^"', '"').strip()
+        escaped = False
+    return ""
+
+
+def _extract_cookie_from_block(block: str) -> str:
+    option = re.search(r"(?i)(?:^|\s)(?:-b|--cookie)\s+", block)
+    if option:
+        cookie = _read_shell_argument(block, option.end())
+        if cookie:
+            return cookie
+    header = re.search(
+        r"(?is)(?:^|\s)(?:-H|--header)\s+(['\"])\s*cookie\s*:\s*(.*?)\1",
+        block,
+    )
     if header:
-        return header.group(1).strip().strip("'\""), region, maildomain_host
-    return text, region, maildomain_host
+        return header.group(2).strip()
+    header = re.search(r"(?im)^\s*cookie\s*:\s*(.+?)\s*$", block)
+    return header.group(1).strip().strip("'\"") if header else ""
+
+
+def _extract_maildomain_host(text: str) -> str:
+    explicit = re.search(
+        r"(?im)^\s*HIDEMYEMAIL_MAILDOMAIN_HOST\s*=\s*([^\s#]+)", text
+    )
+    if explicit:
+        host = _normalize_maildomain_host(explicit.group(1))
+        if host:
+            return host
+    matches = [_normalize_maildomain_host(match.group(1)) for match in MAILDOMAIN_HOST_RE.finditer(text)]
+    return next((host for host in matches if host), "")
+
+
+def _select_cookie_and_host(text: str, normalized: str) -> tuple[str, str]:
+    preferred: list[tuple[str, str]] = []
+    fallback: list[tuple[str, str]] = []
+    for block in _curl_blocks(normalized):
+        cookie = _extract_cookie_from_block(block)
+        if not cookie:
+            continue
+        host = _extract_maildomain_host(block)
+        item = (cookie, host)
+        if host:
+            preferred.append(item)
+        else:
+            fallback.append(item)
+    if preferred:
+        return preferred[-1]
+    if fallback:
+        return fallback[0]
+    return "", ""
+
+
+def _extract_request_params(content: str, preferred_host: str = "") -> dict[str, str]:
+    normalized = _normalize_curl_text(str(content or ""))
+    blocks = _curl_blocks(normalized)
+    preferred_blocks = [
+        block
+        for block in blocks
+        if preferred_host and preferred_host in block and re.search(r"(?i)/(?:v[12]/)?hme/", block)
+    ]
+    candidates = preferred_blocks or blocks
+    keys = ("clientBuildNumber", "clientMasteringNumber", "clientId", "requestId", "dsid")
+    result: dict[str, str] = {}
+    for block in reversed(candidates):
+        for key in keys:
+            if key in result:
+                continue
+            match = re.search(
+                rf"(?i)(?:[?&\s\"']|\b){re.escape(key)}(?:=|\"\s*:\s*\")([A-Za-z0-9_.:-]+)",
+                block,
+            )
+            if match:
+                result[key] = match.group(1)
+    return result
+
+
+def parse_cookie_context(content: str, requested_region: str = "auto") -> tuple[str, str, str]:
+    """Parse a raw cookie, a copied cURL capture, or a generated cookie file."""
+    text = str(content or "").strip()
+    normalized = _normalize_curl_text(text)
+    requested = str(requested_region or "auto").strip().lower()
+    if requested not in {"auto", "global", "china"}:
+        requested = "auto"
+    region_match = re.search(r"(?im)^\s*HIDEMYEMAIL_REGION\s*=\s*(global|china)\s*$", text)
+    region = region_match.group(1).lower() if region_match else requested
+    maildomain_host = _extract_maildomain_host(text)
+
+    encoded = re.search(
+        r"(?im)^\s*HIDEMYEMAIL_COOKIE_BASE64\s*=\s*([A-Za-z0-9+/=]+)\s*$",
+        text,
+    )
+    if encoded:
+        cookie = base64.b64decode(encoded.group(1)).decode("utf-8").strip()
+    else:
+        cookie, block_host = _select_cookie_and_host(text, normalized)
+        maildomain_host = block_host or maildomain_host
+        if not cookie:
+            cookie = text
+    if region == "auto" and maildomain_host:
+        region = _region_for_maildomain_host(maildomain_host)
+    return cookie.strip(), region, maildomain_host
 
 
 async def validate_cookie(payload: dict) -> dict:
-    """验证 CK 并返回经过筛选的账号信息。"""
-    cookie, requested_region, maildomain_host = parse_cookie_context(payload.get("cookie", ""), payload.get("region", "auto"))
-    if "X-APPLE" not in cookie:
-        raise ValueError("CK 中未找到必要的 X-APPLE 字段")
-    regions = [requested_region] if requested_region in {"global", "china"} else ["global", "china"]
-    last_error = "CK 校验失败"
+    """Validate CK and return the account identity plus its HME shard."""
+    source = str(payload.get("cookie", "") or "")
+    cookie, requested_region, maildomain_host = parse_cookie_context(source, payload.get("region", "auto"))
+    if "X-APPLE" not in cookie.upper():
+        raise ValueError("CK does not contain an X-APPLE authorization field; paste a logged-in iCloud Cookie or cURL")
+
+    if requested_region in {"global", "china"}:
+        regions = [requested_region]
+    elif maildomain_host:
+        regions = [_region_for_maildomain_host(maildomain_host)]
+    else:
+        regions = ["global", "china"]
+    request_params = _extract_request_params(source, maildomain_host)
+    errors: list[str] = []
     for region in regions:
-        resolved_host = maildomain_host or HideMyEmail.REGION_CONFIG[region]["maildomain_host"]
-        account = await fetch_account_info_from_cookie(cookie, region, resolved_host)
+        attempt_host = maildomain_host if _host_matches_region(maildomain_host, region) else ""
+        account = await fetch_account_info_from_cookie(cookie, region, attempt_host, request_params)
         if "error" in account:
-            last_error = str(account["error"])
+            errors.append(f"{region}/{attempt_host or 'automatic shard'}: {account['error']}")
             continue
-        ds_info = account.get("dsInfo", {})
-        full_name = ds_info.get("fullName") or " ".join(filter(None, [ds_info.get("firstName"), ds_info.get("lastName")]))
+        ds_info = account.get("dsInfo", {}) or {}
+        full_name = ds_info.get("fullName") or " ".join(
+            filter(None, [ds_info.get("firstName"), ds_info.get("lastName")])
+        )
+        user_partition = str(account.get("userPartition") or "")
+        detected_host = _normalize_maildomain_host(str(account.get("detectedMaildomainHost") or ""))
+        resolved_host = (
+            attempt_host
+            or detected_host
+            or _host_for_partition(user_partition, region)
+            or HideMyEmail.REGION_CONFIG[region]["maildomain_host"]
+        )
         return {
             "ok": True,
             "cookie": cookie,
@@ -62,64 +221,154 @@ async def validate_cookie(payload: dict) -> dict:
             "dsid": str(ds_info.get("dsid") or ""),
             "displayName": full_name or "",
             "featureAvailable": bool(ds_info.get("isHideMyEmailFeatureAvailable")),
-            "userPartition": str(account.get("userPartition") or ""),
+            "userPartition": user_partition,
             "maildomainHost": resolved_host,
         }
-    raise ValueError(last_error)
+    detail = "; ".join(errors) if errors else "unknown error"
+    raise ValueError(f"CK validation failed: {detail}")
 
 
 def response_error(data: dict, fallback: str) -> str:
-    """从 Apple API 响应中提取可读错误。"""
+    """Extract a readable error without ever including the CK."""
     error = data.get("error") if isinstance(data, dict) else None
     if isinstance(error, dict):
-        return str(error.get("errorMessage") or fallback)
-    return str(data.get("reason") or error or fallback) if isinstance(data, dict) else fallback
+        return str(error.get("errorMessage") or error.get("message") or fallback)
+    return str(
+        data.get("reason")
+        or data.get("errorMessage")
+        or error
+        or fallback
+    ) if isinstance(data, dict) else fallback
 
 
-async def resolve_maildomain(cookie: str, region: str, preferred_host: str = "") -> tuple[str, dict]:
-    """通过列表接口验证分片，错误分片自动回退到上游区域默认节点。"""
+def _candidate_maildomain_hosts(region: str, preferred_host: str, user_partition: str) -> list[str]:
     default_host = HideMyEmail.REGION_CONFIG[region]["maildomain_host"]
-    candidates = list(dict.fromkeys(host for host in [preferred_host, default_host] if host))
-    last_error = "无法连接 iCloud maildomain 服务"
+    preferred = _normalize_maildomain_host(preferred_host)
+    derived = _host_for_partition(user_partition, region)
+    candidates: list[str] = []
+    ordered = [preferred, derived, default_host]
+    if preferred == default_host and derived and derived != default_host:
+        ordered = [derived, preferred, default_host]
+    for host in ordered:
+        normalized = _normalize_maildomain_host(host)
+        if normalized and _host_matches_region(normalized, region) and normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
+
+
+async def resolve_maildomain(
+    cookie: str,
+    region: str,
+    preferred_host: str = "",
+    user_partition: str = "",
+    dsid: str = "",
+    client_id: str = "",
+    client_build_number: str = "",
+    client_mastering_number: str = "",
+) -> tuple[str, dict]:
+    """Validate the HME shard, recovering from a stale/default shard when possible."""
+    if region not in {"global", "china"}:
+        raise ValueError("Cannot determine the iCloud region; choose global or china when importing")
+    candidates = _candidate_maildomain_hosts(region, preferred_host, user_partition)
+    errors: list[str] = []
     for host in candidates:
-        async with HideMyEmail(cookies=cookie, region=region, maildomain_host=host) as client:
-            response = await client.list_email()
+        try:
+            async with HideMyEmail(
+                cookies=cookie,
+                region=region,
+                maildomain_host=host,
+                dsid=dsid,
+                client_id=client_id,
+                client_build_number=client_build_number,
+                client_mastering_number=client_mastering_number,
+            ) as client:
+                response = await client.list_email()
+        except Exception as exc:
+            errors.append(f"{host}: network error {str(exc)[:180]}")
+            continue
         if response.get("success"):
             return host, response
-        last_error = response_error(response, last_error)
-    raise ValueError(last_error)
+        errors.append(f"{host}: {response_error(response, 'Apple HME endpoint returned an error')}")
+    tried = ", ".join(candidates) if candidates else "no valid maildomain host"
+    detail = "; ".join(errors) if errors else "no Apple response"
+    raise ValueError(f"HME sync failed (tried {tried}): {detail}")
+
+
+def _operation_context(payload: dict) -> tuple[str, str, str, dict[str, str]]:
+    source = str(payload.get("cookie", "") or "")
+    cookie, region, parsed_host = parse_cookie_context(source, payload.get("region", "global"))
+    payload_host = _normalize_maildomain_host(str(payload.get("maildomainHost") or ""))
+    host = parsed_host or payload_host
+    if region not in {"global", "china"}:
+        region = _region_for_maildomain_host(host) if host else "global"
+    params = _extract_request_params(source, host)
+    return cookie, region, host, params
 
 
 async def generate_addresses(payload: dict) -> dict:
-    """按标签顺序串行生成并保留隐藏邮箱。"""
-    cookie, region, maildomain_host = parse_cookie_context(payload.get("cookie", ""), payload.get("region", "global"))
-    maildomain_host = maildomain_host or str(payload.get("maildomainHost") or "")
+    """Generate and reserve hidden addresses in label order."""
+    cookie, region, maildomain_host, request_params = _operation_context(payload)
+    user_partition = str(payload.get("userPartition") or "")
+    dsid = str(payload.get("dsid") or request_params.get("dsid") or "")
+    client_id = str(payload.get("clientId") or request_params.get("clientId") or "")
+    build_number = str(payload.get("clientBuildNumber") or request_params.get("clientBuildNumber") or "")
+    mastering_number = str(payload.get("clientMasteringNumber") or request_params.get("clientMasteringNumber") or "")
     labels = [str(item).strip() for item in payload.get("labels", []) if str(item).strip()]
     generated = []
     errors = []
-    maildomain_host, _ = await resolve_maildomain(cookie, region, maildomain_host)
-    async with HideMyEmail(cookies=cookie, region=region, maildomain_host=maildomain_host) as client:
+    maildomain_host, _ = await resolve_maildomain(
+        cookie,
+        region,
+        maildomain_host,
+        user_partition,
+        dsid,
+        client_id,
+        build_number,
+        mastering_number,
+    )
+    async with HideMyEmail(
+        cookies=cookie,
+        region=region,
+        maildomain_host=maildomain_host,
+        dsid=dsid,
+        client_id=client_id,
+        client_build_number=build_number,
+        client_mastering_number=mastering_number,
+    ) as client:
         for index, label in enumerate(labels):
             generated_response = await client.generate_email()
             if not generated_response.get("success"):
-                errors.append({"label": label, "error": response_error(generated_response, "生成失败")})
-                errors.extend({"label": skipped, "error": "前序操作失败，未继续执行"} for skipped in labels[index + 1 :])
+                errors.append({"label": label, "error": response_error(generated_response, "generation failed")})
+                errors.extend({"label": skipped, "error": "not run because a previous operation failed"} for skipped in labels[index + 1 :])
                 break
             email = generated_response.get("result", {}).get("hme")
             reserved_response = await client.reserve_email(email, label, "Generated by iCloud Create Workbench")
             if not reserved_response.get("success"):
-                errors.append({"label": label, "error": response_error(reserved_response, "保留失败")})
-                errors.extend({"label": skipped, "error": "前序操作失败，未继续执行"} for skipped in labels[index + 1 :])
+                errors.append({"label": label, "error": response_error(reserved_response, "reserve failed")})
+                errors.extend({"label": skipped, "error": "not run because a previous operation failed"} for skipped in labels[index + 1 :])
                 break
             generated.append({"email": email, "label": label, "createdAt": datetime.now(timezone.utc).isoformat()})
     return {"ok": True, "generated": generated, "errors": errors, "maildomainHost": maildomain_host}
 
 
 async def list_addresses(payload: dict) -> dict:
-    """读取 Apple 账号下的隐藏邮箱列表。"""
-    cookie, region, maildomain_host = parse_cookie_context(payload.get("cookie", ""), payload.get("region", "global"))
-    maildomain_host = maildomain_host or str(payload.get("maildomainHost") or "")
-    maildomain_host, response = await resolve_maildomain(cookie, region, maildomain_host)
+    """Read the account's HME list and return a normalized address set."""
+    cookie, region, maildomain_host, request_params = _operation_context(payload)
+    user_partition = str(payload.get("userPartition") or "")
+    dsid = str(payload.get("dsid") or request_params.get("dsid") or "")
+    client_id = str(payload.get("clientId") or request_params.get("clientId") or "")
+    build_number = str(payload.get("clientBuildNumber") or request_params.get("clientBuildNumber") or "")
+    mastering_number = str(payload.get("clientMasteringNumber") or request_params.get("clientMasteringNumber") or "")
+    maildomain_host, response = await resolve_maildomain(
+        cookie,
+        region,
+        maildomain_host,
+        user_partition,
+        dsid,
+        client_id,
+        build_number,
+        mastering_number,
+    )
     rows = []
     for item in response.get("result", {}).get("hmeEmails", []):
         if item.get("hme"):
@@ -134,24 +383,22 @@ async def list_addresses(payload: dict) -> dict:
 
 
 async def dispatch(command: str, payload: dict) -> dict:
-    """将命令分派到对应的桥接操作。"""
     if command == "validate":
         return await validate_cookie(payload)
     if command == "generate":
         return await generate_addresses(payload)
     if command == "list":
         return await list_addresses(payload)
-    raise ValueError("不支持的 Python 桥接命令")
+    raise ValueError("Unsupported Python bridge command")
 
 
 def main() -> None:
-    """读取标准输入并保证标准输出只包含一行 JSON。"""
     try:
         command = sys.argv[1] if len(sys.argv) > 1 else ""
         payload = json.loads(sys.stdin.read() or "{}")
         result = asyncio.run(dispatch(command, payload))
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
-    except Exception as error:  # 桥接边界需要统一转换所有异常
+    except Exception as error:
         print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False, separators=(",", ":")))
         raise SystemExit(1)
 

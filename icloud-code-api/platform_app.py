@@ -39,7 +39,7 @@ KEY_PATH = DATA_DIR / "platform_master.key"
 OPERATOR_KEY_PATH = DATA_DIR / "platform_admin.key"
 OPERATOR_HTML_PATH = APP_DIR / "operator.html"
 MAX_BODY = 1_048_576
-SERVICE_VERSION = "0.3.0"
+SERVICE_VERSION = "0.3.1"
 INVENTORY_TENANT_ID = "__platform_inventory__"
 INVENTORY_TENANT_EMAIL = "platform-inventory@platform.invalid"
 INVENTORY_TENANT_DISPLAY = "\u5e73\u53f0\u5e93\u5b58\uff08\u672a\u5206\u914d\u5ba2\u6237\uff09"
@@ -1248,6 +1248,8 @@ def sync_icloud_account_addresses(account_id: str) -> dict[str, Any]:
                 "cookie": cookie,
                 "region": account["region"],
                 "maildomainHost": account["maildomain_host"],
+                "userPartition": account["user_partition"],
+                "dsid": account["dsid"],
             },
         )
     except Exception as exc:
@@ -1330,6 +1332,8 @@ def _generation_call(account: dict[str, Any], labels: list[str]) -> tuple[dict[s
             "cookie": cookie,
             "region": account["region"],
             "maildomainHost": account["maildomain_host"],
+            "userPartition": account["user_partition"],
+            "dsid": account["dsid"],
             "labels": labels,
         },
     )
