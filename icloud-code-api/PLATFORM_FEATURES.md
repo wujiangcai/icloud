@@ -47,4 +47,16 @@ POST  /api/v1/operator/icloud-accounts/{id}/generation-campaigns
 GET   /api/v1/operator/mailboxes?page=1&page_size=50&status=inventory
 PATCH /api/v1/operator/mailboxes/{id}/business
 PATCH /api/v1/operator/mailboxes/batch-business
+GET   /api/v1/operator/mailboxes/{id}/delivery
+POST  /api/v1/operator/mailboxes/delivery-export
 ```
+
+## 发货格式
+
+管理员可以在库存页面单独复制或批量下载：
+
+```text
+邮箱----接码地址
+```
+
+接码令牌使用平台主密钥加密保存，重复导出会复用有效链接；旧记录无法恢复令牌时只在第一次导出时更新链接。

@@ -39,7 +39,7 @@ KEY_PATH = DATA_DIR / "platform_master.key"
 OPERATOR_KEY_PATH = DATA_DIR / "platform_admin.key"
 OPERATOR_HTML_PATH = APP_DIR / "operator.html"
 MAX_BODY = 1_048_576
-SERVICE_VERSION = "0.2.0"
+SERVICE_VERSION = "0.3.0"
 INVENTORY_TENANT_ID = "__platform_inventory__"
 INVENTORY_TENANT_EMAIL = "platform-inventory@platform.invalid"
 INVENTORY_TENANT_DISPLAY = "\u5e73\u53f0\u5e93\u5b58\uff08\u672a\u5206\u914d\u5ba2\u6237\uff09"
@@ -339,7 +339,7 @@ def init_db() -> None:
             );
             CREATE TABLE IF NOT EXISTS public_access(
               id TEXT PRIMARY KEY,tenant_id TEXT NOT NULL,mailbox_id TEXT NOT NULL UNIQUE,
-              token_hash TEXT UNIQUE NOT NULL,token_prefix TEXT NOT NULL,
+              token_hash TEXT UNIQUE NOT NULL,token_prefix TEXT NOT NULL,token_ciphertext TEXT NOT NULL DEFAULT '',
               active INTEGER NOT NULL DEFAULT 1,last_access_at TEXT NOT NULL DEFAULT '',
               created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
               FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
@@ -391,6 +391,9 @@ def init_db() -> None:
             conn.execute("ALTER TABLE messages ADD COLUMN r2_object_key TEXT NOT NULL DEFAULT ''")
         if "r2_error" not in message_columns:
             conn.execute("ALTER TABLE messages ADD COLUMN r2_error TEXT NOT NULL DEFAULT ''")
+        public_access_columns = {row["name"] for row in conn.execute("PRAGMA table_info(public_access)").fetchall()}
+        if "token_ciphertext" not in public_access_columns:
+            conn.execute("ALTER TABLE public_access ADD COLUMN token_ciphertext TEXT NOT NULL DEFAULT ''")
 
 
 def hash_password(password: str) -> str:
@@ -653,6 +656,17 @@ class BusinessStatusBatchPayload(BaseModel):
     customer_id: str | None = Field(default=None, max_length=64)
     order_no: str | None = Field(default=None, max_length=128)
     note: str | None = Field(default=None, max_length=1000)
+
+
+class OperatorDeliveryExportPayload(BaseModel):
+    """Selection or filters for exporting ``邮箱----接码地址`` lines."""
+
+    ids: list[str] = Field(default_factory=list, max_length=500)
+    search: str = Field(default="", max_length=100)
+    account_id: str = Field(default="", max_length=64)
+    status: str = Field(default="", max_length=32)
+    has_code: bool | None = None
+    include_inactive: bool = True
 
 
 class OperatorLoginPayload(BaseModel):
@@ -1616,25 +1630,73 @@ def delivery_payload(email: str, viewer_url: str) -> dict[str, str]:
     return {
         "mailbox_email": email,
         "code_url": viewer_url,
+        "delivery_line": f"{email}----{viewer_url}",
         "delivery_text": f"{email}\n{viewer_url}",
     }
 
 
+def ensure_public_access_link(
+    tenant_id: str,
+    mailbox_id: str,
+    rotate: bool = False,
+) -> tuple[str, dict[str, Any], bool]:
+    """Return a reusable public link, creating one when it cannot be recovered.
+
+    Older rows only stored a token hash, so their original raw token cannot be
+    reconstructed. In that case the first export rotates that link once. New
+    links keep the raw token encrypted with the platform master key, never in
+    plaintext, so later exports can reproduce the same delivery URL without
+    invalidating a customer link.
+    """
+    if not rotate:
+        with db() as conn:
+            row = conn.execute(
+                """
+                SELECT p.token_hash,p.token_ciphertext,m.*
+                FROM public_access p JOIN mailboxes m ON m.id=p.mailbox_id
+                JOIN tenants t ON t.id=p.tenant_id
+                WHERE p.mailbox_id=? AND p.tenant_id=? AND p.active=1
+                  AND m.active=1 AND t.active=1
+                """,
+                (mailbox_id, tenant_id),
+            ).fetchone()
+        token = recover_public_access_token(row)
+        if token:
+            return token, dict(row), False
+    token, stored = create_public_access_record(tenant_id, mailbox_id)
+    return token, stored, True
+
+
+def recover_public_access_token(row: Any) -> str:
+    if row is None or not row["token_ciphertext"]:
+        return ""
+    try:
+        token = FERNET.decrypt(row["token_ciphertext"].encode()).decode("ascii")
+    except (InvalidToken, UnicodeDecodeError):
+        return ""
+    return token if token and hmac.compare_digest(row["token_hash"], token_hash(token)) else ""
+
+
+def write_public_access_record(conn: sqlite3.Connection, tenant_id: str, mailbox_id: str, token: str) -> None:
+    stamp = now_iso()
+    access_id = uuid.uuid4().hex
+    token_ciphertext = FERNET.encrypt(token.encode("ascii")).decode("ascii")
+    conn.execute(
+        """
+        INSERT INTO public_access(id,tenant_id,mailbox_id,token_hash,token_prefix,token_ciphertext,active,last_access_at,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,1,'',?,?)
+        ON CONFLICT(mailbox_id) DO UPDATE SET
+          tenant_id=excluded.tenant_id,token_hash=excluded.token_hash,token_prefix=excluded.token_prefix,
+          token_ciphertext=excluded.token_ciphertext,active=1,last_access_at='',updated_at=excluded.updated_at
+        """,
+        (access_id, tenant_id, mailbox_id, token_hash(token), token[:12], token_ciphertext, stamp, stamp),
+    )
+
+
 def create_public_access_record(tenant_id: str, mailbox_id: str) -> tuple[str, dict[str, Any]]:
     token = "pub_" + secrets.token_urlsafe(32)
-    access_id = uuid.uuid4().hex
-    stamp = now_iso()
     with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO public_access(id,tenant_id,mailbox_id,token_hash,token_prefix,active,last_access_at,created_at,updated_at)
-            VALUES(?,?,?,?,?,1,'',?,?)
-            ON CONFLICT(mailbox_id) DO UPDATE SET
-              tenant_id=excluded.tenant_id,token_hash=excluded.token_hash,token_prefix=excluded.token_prefix,
-              active=1,last_access_at='',updated_at=excluded.updated_at
-            """,
-            (access_id, tenant_id, mailbox_id, token_hash(token), token[:12], stamp, stamp),
-        )
+        write_public_access_record(conn, tenant_id, mailbox_id, token)
         row = conn.execute(
             "SELECT * FROM mailboxes WHERE id=? AND tenant_id=? AND active=1",
             (mailbox_id, tenant_id),
@@ -2123,6 +2185,102 @@ def operator_export_mailboxes(
             row["updated_at"], row["last_sync_at"], row["last_error"],
         )))
     return PlainTextResponse("\ufeff" + "\r\n".join(lines), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=icloud-mailboxes.csv"})
+
+
+@app.get("/api/v1/operator/mailboxes/{mailbox_id}/delivery")
+def operator_mailbox_delivery(
+    mailbox_id: str,
+    request: Request,
+    _operator: bool = Depends(require_operator),
+) -> dict[str, Any]:
+    """Return one reusable ``邮箱----接码地址`` line for manual delivery."""
+    row = operator_mailbox_row(mailbox_id, active_only=False)
+    if not row["active"] or not row["tenant_active"]:
+        raise HTTPException(409, "停用邮箱或客户没有可用的公开接码地址")
+    token, stored, created = ensure_public_access_link(row["tenant_id"], mailbox_id)
+    links = public_link_payload(token)
+    audit(row["tenant_id"], "operator.mailbox.delivery.export", request, mailbox_id)
+    return {
+        "ok": True,
+        "created": created,
+        "mailbox": operator_public_mailbox(operator_mailbox_row(mailbox_id)),
+        **links,
+        **delivery_payload(stored["email"], links["viewer_url"]),
+    }
+
+
+@app.post("/api/v1/operator/mailboxes/delivery-export")
+def operator_delivery_export(
+    payload: OperatorDeliveryExportPayload,
+    request: Request,
+    _operator: bool = Depends(require_operator),
+) -> PlainTextResponse:
+    """Export selected or filtered mailboxes in customer-ready text format."""
+    ids = list(dict.fromkeys(str(item).strip() for item in payload.ids if str(item).strip()))[:500]
+    where = ["1=1"]
+    values: list[Any] = []
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        where.append(f"m.id IN ({placeholders})")
+        values.extend(ids)
+    else:
+        if not payload.include_inactive:
+            where.append("m.active=1")
+        if payload.account_id.strip():
+            where.append("m.account_id=?")
+            values.append(payload.account_id.strip())
+        if payload.status.strip():
+            where.append("m.business_status=?")
+            values.append(validate_business_status(payload.status))
+        if payload.has_code is True:
+            where.append("EXISTS(SELECT 1 FROM messages hc WHERE hc.mailbox_id=m.id AND hc.code!='')")
+        elif payload.has_code is False:
+            where.append("NOT EXISTS(SELECT 1 FROM messages hc WHERE hc.mailbox_id=m.id AND hc.code!='')")
+        if payload.search.strip():
+            term = f"%{payload.search.strip()}%"
+            where.append("(m.email LIKE ? OR m.label LIKE ? OR m.apple_label LIKE ? OR m.customer_id LIKE ? OR m.order_no LIKE ? OR t.email LIKE ? OR a.apple_id LIKE ?)")
+            values.extend([term] * 7)
+    clause = " AND ".join(where)
+    lines: list[str] = []
+    skipped = 0
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT m.id,m.tenant_id,m.email,m.active,t.active AS tenant_active
+            FROM mailboxes m JOIN tenants t ON t.id=m.tenant_id
+              LEFT JOIN icloud_accounts a ON a.id=m.account_id
+            WHERE {clause}
+            ORDER BY m.updated_at DESC
+            LIMIT 10000
+            """,
+            tuple(values),
+        ).fetchall()
+        for row in rows:
+            if not row["active"] or not row["tenant_active"]:
+                skipped += 1
+                continue
+            access = conn.execute(
+                "SELECT token_hash,token_ciphertext FROM public_access WHERE mailbox_id=? AND tenant_id=? AND active=1",
+                (row["id"], row["tenant_id"]),
+            ).fetchone()
+            token = recover_public_access_token(access)
+            if not token:
+                token = "pub_" + secrets.token_urlsafe(32)
+                write_public_access_record(conn, row["tenant_id"], row["id"], token)
+            links = public_link_payload(token)
+            lines.append(delivery_payload(row["email"], links["viewer_url"])["delivery_line"])
+    if not lines:
+        raise HTTPException(404, "没有可导出的有效邮箱")
+    audit(None, "operator.mailbox.delivery.batch_export", request)
+    return PlainTextResponse(
+        "\ufeff" + "\r\n".join(lines) + "\r\n",
+        media_type="text/plain",
+        headers={
+            "Content-Disposition": "attachment; filename=icloud-delivery.txt",
+            "X-Exported-Count": str(len(lines)),
+            "X-Skipped-Count": str(skipped),
+        },
+    )
 
 
 def operator_public_mailbox(row: dict[str, Any]) -> dict[str, Any]:

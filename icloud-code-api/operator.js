@@ -53,6 +53,34 @@ function showOutput(title, text) {
     const copy = document.querySelector("[data-copy]"); if (copy) copy.onclick = async () => { await navigator.clipboard.writeText(text); showToast("已复制"); };
   }, 0);
 }
+function downloadText(text, filename) {
+  const blob = new Blob(["\ufeff", text], {type:"text/plain;charset=utf-8"});
+  const url = URL.createObjectURL(blob); const link = document.createElement("a");
+  link.href = url; link.download = filename; link.click(); URL.revokeObjectURL(url);
+}
+function inventoryDeliveryFilters() {
+  return {
+    ids: [], search: $("inventorySearch").value.trim(), status: $("inventoryStatus").value,
+    account_id: $("inventoryAccount").value,
+    has_code: $("inventoryCode").value === "" ? null : $("inventoryCode").value === "true",
+    include_inactive: true,
+  };
+}
+async function exportDelivery(payload, filename) {
+  const response = await fetch("/api/v1/operator/mailboxes/delivery-export", {
+    method:"POST", headers:{"Content-Type":"application/json", Authorization:"Bearer "+token},
+    body: JSON.stringify(payload), cache:"no-store",
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    let detail = "导出发货信息失败";
+    try { const data = JSON.parse(text); detail = data.detail || data.error || detail; } catch (_) {}
+    if (response.status === 401) clearSession();
+    throw Error(detail);
+  }
+  downloadText(text.replace(/^\ufeff/, ""), filename);
+  return {text, count: response.headers.get("X-Exported-Count") || ""};
+}
 function setView(view) {
   document.querySelectorAll(".nav button").forEach(button => button.classList.toggle("active", button.dataset.view === view));
   document.querySelectorAll(".view").forEach(node => node.classList.toggle("active", node.id === view + "View"));
@@ -127,7 +155,7 @@ function makeMailboxRow(mailbox) {
   cell=document.createElement("td");cell.innerHTML=mailbox.latest_code?`<span class="code">${safe(mailbox.latest_code)}</span><small style="display:block;color:#98a2b3">${fmt(mailbox.latest_code_at)}</small>`:'<span class="muted">—</span>';row.append(cell);
   cell=document.createElement("td");cell.textContent=String(mailbox.message_count||0);row.append(cell);
   cell=document.createElement("td");cell.className="mail-cell";cell.innerHTML=`<strong class="${mailbox.last_error?'danger-text':''}">${mailbox.last_error?'异常':fmt(mailbox.last_sync_at)}</strong><small>${safe(mailbox.last_error||"")}</small>`;row.append(cell);
-  cell=document.createElement("td");const actions=document.createElement("div");actions.className="actions";const add=(text,fn)=>{const b=document.createElement("button");b.className="button small";b.textContent=text;b.onclick=fn;actions.append(b);};add("状态",()=>openStatusModal(mailbox));add("历史",()=>showMessages(mailbox));add(mailbox.public_access_enabled?"重置链接":"生成链接",async()=>{try{const x=await api(`/api/v1/operator/mailboxes/${mailbox.id}/public-access`,{method:"POST",body:"{}"});showOutput("发货信息",`${x.delivery_text}\n\n查看页：\n${x.viewer_url}\n\n访问令牌：\n${x.token}`);loadInventory();}catch(e){showToast(e.message,true);}});cell.append(actions);row.append(cell);return row;
+  cell=document.createElement("td");const actions=document.createElement("div");actions.className="actions";const add=(text,fn)=>{const b=document.createElement("button");b.className="button small";b.textContent=text;b.onclick=fn;actions.append(b);};add("状态",()=>openStatusModal(mailbox));add("历史",()=>showMessages(mailbox));add("发货",async()=>{try{const x=await api(`/api/v1/operator/mailboxes/${mailbox.id}/delivery`);showOutput("单个发货格式",x.delivery_line);loadInventory();}catch(e){showToast(e.message,true);}});add(mailbox.public_access_enabled?"重置链接":"生成链接",async()=>{try{const x=await api(`/api/v1/operator/mailboxes/${mailbox.id}/public-access`,{method:"POST",body:"{}"});showOutput("发货信息",`${x.delivery_line}\n\n查看页：\n${x.viewer_url}\n\n访问令牌：\n${x.token}`);loadInventory();}catch(e){showToast(e.message,true);}});cell.append(actions);row.append(cell);return row;
 }
 function openStatusModal(mailbox) {
   openModal("修改邮箱状态",`<div class="form-grid"><label>状态<select data-status>${statusOptions("")}</select></label><label>客户ID（可选）<input data-customer class="input" value="${safe(mailbox.customer_id)}"></label><label>订单号（可选）<input data-order class="input" value="${safe(mailbox.order_no)}"></label><label>备注<textarea data-note>${safe(mailbox.note)}</textarea></label><div data-error class="error"></div></div><div class="form-actions"><button data-submit class="button primary"></button></div>`,"保存",async box=>{box.querySelector("[data-status]").value=mailbox.business_status;await api(`/api/v1/operator/mailboxes/${mailbox.id}/business`,{method:"PATCH",body:JSON.stringify({status:box.querySelector("[data-status]").value,customer_id:box.querySelector("[data-customer]").value,order_no:box.querySelector("[data-order]").value,note:box.querySelector("[data-note]").value})});closeModal();showToast("状态已更新");loadInventory();loadOverview();});
@@ -146,6 +174,8 @@ $("menuBtn").onclick=()=>$("sidebar").classList.toggle("open");$("importAccountB
 $("inventorySearchBtn").onclick=()=>{inventoryPage=1;loadInventory();};$("inventorySearch").onkeydown=event=>{if(event.key==="Enter")$("inventorySearchBtn").click();};$("prevPage").onclick=()=>{if(inventoryPage>1){inventoryPage--;loadInventory();}};$("nextPage").onclick=()=>{inventoryPage++;loadInventory();};$("pageSize").onchange=()=>{inventoryPage=1;loadInventory();};
 $("selectAll").onchange=event=>{document.querySelectorAll("#inventoryRows input[type=checkbox]").forEach(check=>{check.checked=event.target.checked;check.dispatchEvent(new Event("change"));});};
 $("bulkApply").onclick=async()=>{const status=$("bulkStatus").value;if(!status||!selected.size){showToast("请选择邮箱和目标状态",true);return;}try{await api("/api/v1/operator/mailboxes/batch-business",{method:"PATCH",body:JSON.stringify({ids:[...selected],status,customer_id:$("bulkCustomer").value||null,order_no:$("bulkOrder").value||null})});showToast(`已批量更新 ${selected.size} 条`);selected.clear();loadInventory();loadOverview();}catch(e){showToast(e.message,true);}};
+$("bulkDeliveryBtn").onclick=async()=>{if(!selected.size){showToast("请先选择要导出的邮箱",true);return;}try{const count=selected.size;const x=await exportDelivery({...inventoryDeliveryFilters(),ids:[...selected]},"icloud-delivery-selected.txt");showToast(`已导出 ${x.count||count} 条发货信息`);}catch(e){showToast(e.message,true);}};
+$("deliveryExportBtn").onclick=async()=>{try{const x=await exportDelivery(inventoryDeliveryFilters(),"icloud-delivery.txt");showToast(`已导出 ${x.count||"筛选结果"} 条发货信息`);}catch(e){showToast(e.message,true);}};
 $("exportBtn").onclick=async()=>{try{const params=new URLSearchParams({search:$("inventorySearch").value.trim(),status:$("inventoryStatus").value,account_id:$("inventoryAccount").value,include_inactive:"true"});const response=await fetch("/api/v1/operator/mailboxes/export?"+params,{headers:{Authorization:"Bearer "+token}});if(!response.ok)throw Error("导出失败");const url=URL.createObjectURL(await response.blob());const link=document.createElement("a");link.href=url;link.download="icloud-mailboxes.csv";link.click();URL.revokeObjectURL(url);}catch(e){showToast(e.message,true);}};
 
 if (token) { $("loginView").classList.add("hidden");$("appView").classList.remove("hidden");Promise.all([loadOverview(),loadAccounts()]).catch(clearSession); }
