@@ -1,10 +1,15 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-ENV PYTHONUNBUFFERED=1 PYTHONUTF8=1
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONUTF8=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
 COPY requirements-platform.txt ./
-RUN pip install --no-cache-dir -r requirements-platform.txt
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gosu \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r requirements-platform.txt
 
 COPY app.py platform_app.py platform_worker.py operator.html operator.css operator.js ./
 COPY python ./python
@@ -13,6 +18,9 @@ RUN mkdir -p /app/data/platform \
     && useradd --create-home --uid 10001 app \
     && chown -R app:app /app
 
-USER app
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 755 /usr/local/bin/docker-entrypoint.sh
+
 EXPOSE 8766
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["uvicorn", "platform_app:app", "--host", "0.0.0.0", "--port", "8766"]

@@ -4,6 +4,9 @@ let accounts = [];
 let selected = new Set();
 let inventoryPage = 1;
 let toastTimer;
+let generationJobs = [];
+let generationPollTimer;
+let generationPollInFlight = false;
 let statusLabels = {
   inventory: "库存中", sold: "已卖出", self_member: "自用会员",
   self_no_member: "自用未开会员", disabled: "停用", trash: "失效/垃圾"
@@ -17,6 +20,8 @@ const showToast = (message, error=false) => {
 };
 const clearSession = () => {
   token = ""; localStorage.removeItem("platformOperatorSession");
+  clearInterval(generationPollTimer); generationPollTimer = undefined; generationPollInFlight = false;
+  generationJobs = []; renderTaskIndicator(generationJobs);
   $("appView").classList.add("hidden"); $("loginView").classList.remove("hidden");
 };
 const api = async (path, options={}) => {
@@ -29,6 +34,61 @@ const api = async (path, options={}) => {
 };
 const statusOptions = (first="全部状态") => `<option value="">${first}</option>` + Object.entries(statusLabels).map(([key,label]) => `<option value="${key}">${label}</option>`).join("");
 const accountOptions = () => `<option value="">全部 iCloud 账号</option>` + accounts.map(a => `<option value="${safe(a.id)}">${safe(a.apple_id || a.display_name || a.id)}</option>`).join("");
+function generationJobState(job) {
+  const status = String(job.status || "").toLowerCase();
+  if (status === "completed") return {label:"已完成", className:"completed"};
+  if (status === "stopped") return {label:"已停止", className:"stopped"};
+  if (status === "failed") return {label:"失败", className:"failed"};
+  if (status === "queued") return {label:"待执行", className:"waiting"};
+  const next = job.next_run_at ? new Date(job.next_run_at) : null;
+  if (next && !Number.isNaN(next.getTime()) && next.getTime() > Date.now() + 1000) {
+    return {label:job.last_error ? "等待重试" : Number(job.generated_count || 0) ? "等待下一批" : "等待执行", className:job.last_error ? "failed" : "waiting"};
+  }
+  return {label:Number(job.generated_count || 0) ? "运行中" : "待执行", className:"running"};
+}
+function renderTaskIndicator(jobs) {
+  const root = $("taskIndicator");
+  if (!root) return;
+  const activeStatuses = new Set(["queued", "running"]);
+  const job = jobs.find(item => activeStatuses.has(String(item.status || "").toLowerCase())) || jobs[0];
+  if (!job) { root.className = "task-indicator hidden"; root.textContent = ""; root.onclick = null; return; }
+  const state = generationJobState(job);
+  const generated = Number(job.generated_count || 0);
+  const target = Number(job.target_total || 0);
+  const nextText = state.className === "waiting" && job.next_run_at ? " · 下次 " + fmt(job.next_run_at) : "";
+  root.className = "task-indicator " + state.className;
+  root.innerHTML = '<span class="task-indicator-dot" aria-hidden="true"></span><span class="task-indicator-copy"><strong>批量生成 · ' + state.label + '</strong><small>' + safe(job.apple_id || job.account_id || "iCloud 账号") + ' · 本任务 ' + generated + "/" + target + nextText + '</small></span><span class="task-indicator-arrow" aria-hidden="true">&#8594;</span>';
+  root.onclick = () => { setView("overview"); window.setTimeout(() => $("jobTable")?.scrollIntoView({behavior:"smooth", block:"center"}), 0); };
+}
+async function loadGenerationJobs() {
+  const data = await api("/api/v1/operator/generation-jobs");
+  generationJobs = data.jobs || [];
+  renderTaskIndicator(generationJobs);
+  return generationJobs;
+}
+function startGenerationPolling() {
+  clearInterval(generationPollTimer);
+  generationPollTimer = setInterval(async () => {
+    if (!token || generationPollInFlight) return;
+    generationPollInFlight = true;
+    try {
+      const jobs = await loadGenerationJobs();
+      if (document.querySelector("#overviewView.active")) renderJobs(jobs);
+      if (document.querySelector("#accountsView.active")) await loadAccounts(jobs);
+    } catch (_) {}
+    finally { generationPollInFlight = false; }
+  }, 15000);
+}
+function renderAccountGeneration(account, job) {
+  if (!job) return "";
+  const state = generationJobState(job);
+  const generated = Number(job.generated_count || 0);
+  const target = Number(job.target_total || 0);
+  const current = Number(account.address_count || 0);
+  const percentage = target ? Math.min(100, Math.round(current / target * 100)) : 0;
+  const nextText = state.className === "waiting" && job.next_run_at ? "下次运行：" + fmt(job.next_run_at) : state.label;
+  return '<div class="account-generation ' + state.className + '"><div class="account-generation-head"><strong>批量生成任务</strong><span class="job-status ' + state.className + '">' + state.label + '</span></div><div class="account-generation-count"><b>' + current + " / " + target + '</b><span>当前库存 / 目标总量</span></div><div class="account-generation-progress"><i style="width:' + percentage + '%"></i></div><small>本任务已生成 ' + generated + ' 个 · ' + nextText + '</small>' + (job.last_error ? '<div class="account-generation-error">' + safe(job.last_error) + '</div>' : "") + '</div>';
+}
 const compactICloudCurl = value => {
   const text = String(value || "").trim();
   if (!/\bcurl(?:\.exe)?\s/i.test(text)) return text;
@@ -107,34 +167,57 @@ async function loadOverview() {
   $("inventoryStatus").innerHTML = statusOptions(); $("bulkStatus").innerHTML = statusOptions("批量改状态");
   const usage = data.r2_usage || {}; const pct = usage.max_bytes ? Math.min(100, Math.round(usage.put_bytes / usage.max_bytes * 100)) : 0;
   $("r2Text").textContent = `${Math.round((usage.put_bytes||0)/1024/1024*10)/10} MB / ${Math.round((usage.max_bytes||0)/1024/1024/1024*10)/10} GB`; $("r2Bar").style.width = pct + "%";
-  const jobs = await api("/api/v1/operator/generation-jobs"); renderJobs(jobs.jobs || []);
+  const jobs = await loadGenerationJobs(); renderJobs(jobs);
 }
 function renderJobs(jobs) {
   const root = $("jobTable"); root.textContent = "";
-  if (!jobs.length) { root.innerHTML = `<div class="empty">暂无生成任务</div>`; return; }
+  if (!jobs.length) { root.innerHTML = '<div class="empty">暂无生成任务</div>'; return; }
   const table = document.createElement("table"); table.className = "data-table"; table.innerHTML = "<thead><tr><th>账号</th><th>目标</th><th>已生成</th><th>状态</th><th>下次运行</th><th>错误</th><th>操作</th></tr></thead>";
   const body = document.createElement("tbody");
   jobs.forEach(job => {
-    const row = document.createElement("tr"); [job.apple_id||job.account_id,job.target_total,job.generated_count,job.status,job.next_run_at?fmt(job.next_run_at):"立即",job.last_error||"—"].forEach(value => { const cell=document.createElement("td"); cell.textContent=value; row.append(cell); });
-    const cell = document.createElement("td");
-    if (job.status === "running") { const button=document.createElement("button"); button.className="button small"; button.textContent="停止"; button.onclick=async()=>{await api(`/api/v1/operator/generation-jobs/${job.id}/stop`,{method:"POST",body:"{}"});showToast("任务已停止");loadOverview();};cell.append(button); }
-    if (job.status === "stopped" || job.status === "failed") { const button=document.createElement("button");button.className="button small";button.textContent="继续";button.onclick=async()=>{await api(`/api/v1/operator/generation-jobs/${job.id}/resume`,{method:"POST",body:"{}"});showToast("任务已继续");loadOverview();};cell.append(button); }
-    row.append(cell); body.append(row);
+    const status = String(job.status || "").toLowerCase();
+    const state = generationJobState(job);
+    const row = document.createElement("tr");
+    [job.apple_id || job.account_id, job.target_total, job.generated_count].forEach(value => { const cell = document.createElement("td"); cell.textContent = value ?? "—"; row.append(cell); });
+    const statusCell = document.createElement("td");
+    const badge = document.createElement("span"); badge.className = "job-status " + state.className; badge.textContent = state.label; statusCell.append(badge); row.append(statusCell);
+    const nextCell = document.createElement("td"); nextCell.textContent = job.next_run_at ? fmt(job.next_run_at) : (["running", "queued"].includes(status) ? "立即" : "—"); row.append(nextCell);
+    const errorCell = document.createElement("td"); errorCell.textContent = job.last_error || "—"; row.append(errorCell);
+    const actionCell = document.createElement("td");
+    if (["running", "queued"].includes(status)) {
+      const button = document.createElement("button"); button.className = "button small"; button.textContent = "停止";
+      button.onclick = async () => { button.disabled = true; try { await api("/api/v1/operator/generation-jobs/" + job.id + "/stop", {method:"POST", body:"{}"}); showToast("任务已停止"); await loadOverview(); } catch (error) { showToast(error.message, true); } finally { button.disabled = false; } };
+      actionCell.append(button);
+    } else if (["stopped", "failed"].includes(status)) {
+      const button = document.createElement("button"); button.className = "button small"; button.textContent = "继续";
+      button.onclick = async () => { button.disabled = true; try { await api("/api/v1/operator/generation-jobs/" + job.id + "/resume", {method:"POST", body:"{}"}); showToast("任务已继续"); await loadOverview(); } catch (error) { showToast(error.message, true); } finally { button.disabled = false; } };
+      actionCell.append(button);
+    }
+    row.append(actionCell); body.append(row);
   }); table.append(body); root.append(table);
 }
-
-async function loadAccounts() {
-  const data = await api("/api/v1/operator/icloud-accounts"); accounts = data.accounts || []; $("inventoryAccount").innerHTML = accountOptions();
+async function loadAccounts(jobs = null) {
+  if (!Array.isArray(jobs)) jobs = null;
+  const [data, jobData] = await Promise.all([
+    api("/api/v1/operator/icloud-accounts"),
+    jobs === null ? api("/api/v1/operator/generation-jobs") : Promise.resolve({jobs}),
+  ]);
+  accounts = data.accounts || [];
+  generationJobs = jobData.jobs || [];
+  renderTaskIndicator(generationJobs);
+  $("inventoryAccount").innerHTML = accountOptions();
+  const latestJobs = new Map();
+  generationJobs.forEach(job => { const accountId = String(job.account_id || ""); if (accountId && !latestJobs.has(accountId)) latestJobs.set(accountId, job); });
   const root = $("accountList"); root.textContent = "";
-  if (!accounts.length) { root.innerHTML = `<div class="empty" style="grid-column:1/-1">还没有 iCloud 账号，点击“导入 CK 账号”开始。</div>`; return; }
+  if (!accounts.length) { root.innerHTML = '<div class="empty" style="grid-column:1/-1">还没有 iCloud 账号，点击“导入 CK 账号”开始。</div>'; return; }
   accounts.forEach(account => {
-    const card=document.createElement("article");card.className="account-card";
-    card.innerHTML=`<div style="display:flex;justify-content:space-between;gap:8px"><h3>${safe(account.apple_id||account.display_name||"未命名账号")}</h3><span class="status ${account.status==='active'?'inventory':'off'}">${account.status==='active'?'正常':'异常'}</span></div><div class="meta">${safe(account.display_name||"")} · ${safe(account.region)} · ${account.imap_configured?'IMAP 已配置':'IMAP 未配置'}</div><div class="account-counts">${Object.entries(statusLabels).filter(([key])=>(account.status_counts||{})[key]).map(([key,label])=>`<span class="chip">${label} ${(account.status_counts||{})[key]}</span>`).join("")||'<span class="muted">暂无邮箱</span>'}</div><div class="meta" style="margin-top:10px">Apple 同步：${fmt(account.last_apple_sync_at)} · IMAP：${fmt(account.last_imap_sync_at)}</div>${account.last_error?`<div class="danger-text" style="font-size:12px;margin-top:7px">${safe(account.last_error)}</div>`:''}`;
-    const actions=document.createElement("div");actions.className="account-actions";
-    const add=(text,fn)=>{const b=document.createElement("button");b.className="button small";b.textContent=text;b.onclick=fn;actions.append(b);};
-    add("同步隐藏邮箱",async()=>{try{const x=await api(`/api/v1/operator/icloud-accounts/${account.id}/sync`,{method:"POST",body:"{}"});showToast(`已同步 ${x.synced} 个隐藏邮箱`);loadAccounts();loadInventory();}catch(e){showToast(e.message,true);}});
+    const card=document.createElement("article"); card.className="account-card";
+    card.innerHTML='<div style="display:flex;justify-content:space-between;gap:8px"><h3>' + safe(account.apple_id || account.display_name || "未命名账号") + '</h3><span class="status ' + (account.status === "active" ? "inventory" : "off") + '">' + (account.status === "active" ? "正常" : "异常") + '</span></div><div class="meta">' + safe(account.display_name || "") + ' · ' + safe(account.region) + ' · ' + (account.imap_configured ? "IMAP 已配置" : "IMAP 未配置") + '</div><div class="account-counts">' + (Object.entries(statusLabels).filter(([key]) => (account.status_counts || {})[key]).map(([key,label]) => '<span class="chip">' + label + " " + (account.status_counts || {})[key] + '</span>').join("") || '<span class="muted">暂无邮箱</span>') + '</div><div class="meta" style="margin-top:10px">Apple 同步：' + fmt(account.last_apple_sync_at) + ' · IMAP：' + fmt(account.last_imap_sync_at) + '</div>' + renderAccountGeneration(account, latestJobs.get(String(account.id))) + (account.last_error ? '<div class="danger-text" style="font-size:12px;margin-top:7px">' + safe(account.last_error) + '</div>' : "");
+    const actions=document.createElement("div"); actions.className="account-actions";
+    const add=(text,fn)=>{const b=document.createElement("button"); b.className="button small"; b.textContent=text; b.onclick=fn; actions.append(b);};
+    add("同步隐藏邮箱",async()=>{try{const x=await api("/api/v1/operator/icloud-accounts/" + account.id + "/sync",{method:"POST",body:"{}"});showToast("已同步 " + x.synced + " 个隐藏邮箱");loadAccounts();loadInventory();}catch(e){showToast(e.message,true);}});
     add("配置 IMAP",()=>openImapModal(account)); add("生成一批",()=>openGenerateModal(account,"batch")); add("批量生成任务",()=>openGenerateModal(account,"campaign"));
-    card.append(actions);root.append(card);
+    card.append(actions); root.append(card);
   });
 }
 function openImportModal() {
@@ -145,7 +228,16 @@ function openImapModal(account) {
 }
 function openGenerateModal(account, mode) {
   const batch=mode==="batch";
-  openModal(batch?"生成隐藏邮箱":"创建批量生成任务",`<div class="form-grid"><div class="notice">每批最多 5 个。批量任务会按 Apple 账号冷却时间自动继续。</div>${batch?'<label>本批数量（1-5）<input data-count class="input" type="number" min="1" max="5" value="1"></label>':'<label>目标总数量<input data-target class="input" type="number" min="1" max="700" value="700"></label><label>每批数量（1-5）<input data-batch class="input" type="number" min="1" max="5" value="5"></label>'}<label>Apple 标签前缀<input data-prefix class="input" value="${safe(account.label_prefix||"icloud")}"></label><div data-error class="error"></div></div><div class="form-actions"><button data-submit class="button primary"></button></div>`,batch?"开始生成":"创建任务",async box=>{const prefix=box.querySelector("[data-prefix]").value;const path=batch?`/api/v1/operator/icloud-accounts/${account.id}/generate`:`/api/v1/operator/icloud-accounts/${account.id}/generation-campaigns`;const body=batch?{count:Number(box.querySelector("[data-count]").value),label_prefix:prefix}:{target_total:Number(box.querySelector("[data-target]").value),batch_size:Number(box.querySelector("[data-batch]").value),label_prefix:prefix};const x=await api(path,{method:"POST",body:JSON.stringify(body)});closeModal();showToast(batch?`生成完成 ${(x.generated||[]).length} 个`:"批量任务已创建");loadAccounts();loadInventory();loadOverview();});
+  openModal(batch?"生成隐藏邮箱":"创建批量生成任务",`<div class="form-grid"><div class="notice">每批最多 5 个。批量任务会按 Apple 账号冷却时间自动继续。</div>${batch?'<label>本批数量（1-5）<input data-count class="input" type="number" min="1" max="5" value="1"></label>':'<label>目标总数量<input data-target class="input" type="number" min="1" max="700" value="700"></label><label>每批数量（1-5）<input data-batch class="input" type="number" min="1" max="5" value="5"></label>'}<label>Apple 标签前缀<input data-prefix class="input" value="${safe(account.label_prefix||"icloud")}"></label><div data-error class="error"></div></div><div class="form-actions"><button data-submit class="button primary"></button></div>`,batch?"开始生成":"创建任务",async box=>{const prefix=box.querySelector("[data-prefix]").value;const path=batch?`/api/v1/operator/icloud-accounts/${account.id}/generate`:`/api/v1/operator/icloud-accounts/${account.id}/generation-campaigns`;const body=batch?{count:Number(box.querySelector("[data-count]").value),label_prefix:prefix}:{target_total:Number(box.querySelector("[data-target]").value),batch_size:Number(box.querySelector("[data-batch]").value),label_prefix:prefix};const x=await api(path,{method:"POST",body:JSON.stringify(body)});closeModal();
+  if (batch) {
+    showToast("生成完成 " + (x.generated || []).length + " 个");
+  } else {
+    const job = x.job;
+    if (job) { generationJobs = [job, ...generationJobs.filter(item => item.id !== job.id)]; renderTaskIndicator(generationJobs); }
+    const progress = job ? "\uFF08\u5F53\u524D " + Number(job.generated_count || 0) + "/" + Number(job.target_total || 0) + "\uFF09" : "";
+    showToast("批量任务已创建，顶部已显示任务状态" + progress);
+  }
+  await Promise.allSettled([loadAccounts(), loadInventory(), loadOverview()]);});
 }
 
 async function loadInventory() {
@@ -234,7 +326,7 @@ async function showMessages(mailbox) { try { const data=await api(`/api/v1/opera
 async function loadTenants() { const data=await api("/api/v1/operator/tenants");const root=$("tenantRows");root.textContent="";(data.tenants||[]).forEach(tenant=>{const row=document.createElement("tr");[tenant.email,tenant.active?"正常":"停用",tenant.mailbox_count,tenant.message_count,fmt(tenant.last_sync_at)].forEach(value=>{const cell=document.createElement("td");cell.textContent=value;row.append(cell);});const cell=document.createElement("td");const button=document.createElement("button");button.className="button small";button.textContent=tenant.active?"停用":"启用";button.onclick=async()=>{await api(`/api/v1/operator/tenants/${tenant.id}`,{method:"PATCH",body:JSON.stringify({active:!tenant.active})});showToast("客户状态已更新");loadTenants();};cell.append(button);row.append(cell);root.append(row);});if(!data.tenants?.length)root.innerHTML='<tr><td colspan="6" class="empty">暂无客户，邮箱库存不需要先创建客户。</td></tr>'; }
 function openTenantModal() { openModal("创建客户",`<div class="form-grid"><label>客户邮箱<input data-email class="input" type="email"></label><label>初始密码<input data-password class="input" type="password"></label><div data-error class="error"></div></div><div class="form-actions"><button data-submit class="button primary"></button></div>`,"创建",async box=>{await api("/api/v1/operator/tenants",{method:"POST",body:JSON.stringify({email:box.querySelector("[data-email]").value,password:box.querySelector("[data-password]").value})});closeModal();showToast("客户已创建");loadTenants();}); }
 
-$("loginBtn").onclick=async()=>{const error=$("loginError");error.textContent="";try{const data=await api("/api/v1/operator/login",{method:"POST",body:JSON.stringify({key:$("loginKey").value})});token=data.access_token;localStorage.setItem("platformOperatorSession",token);$("loginView").classList.add("hidden");$("appView").classList.remove("hidden");await loadOverview();await loadAccounts();}catch(e){error.textContent=e.message;}};
+$("loginBtn").onclick=async()=>{const error=$("loginError");error.textContent="";try{const data=await api("/api/v1/operator/login",{method:"POST",body:JSON.stringify({key:$("loginKey").value})});token=data.access_token;localStorage.setItem("platformOperatorSession",token);$("loginView").classList.add("hidden");$("appView").classList.remove("hidden");await loadOverview();await loadAccounts();startGenerationPolling();}catch(e){error.textContent=e.message;}};
 $("loginKey").onkeydown=event=>{if(event.key==="Enter")$("loginBtn").click()};
 document.querySelectorAll(".nav button").forEach(button=>button.onclick=()=>setView(button.dataset.view));
 $("logoutBtn").onclick=async()=>{try{await api("/api/v1/operator/logout",{method:"POST",body:"{}"});}catch(_){}clearSession();};
@@ -247,4 +339,4 @@ $("bulkDeliveryBtn").onclick=async()=>{if(!selected.size){showToast("请先选�
 $("deliveryExportBtn").onclick=async()=>{try{const x=await exportDelivery(inventoryDeliveryFilters(),"icloud-delivery.txt");showToast(`已导出 ${x.count||"筛选结果"} 条发货信息`);}catch(e){showToast(e.message,true);}};
 $("exportBtn").onclick=async()=>{try{const params=new URLSearchParams({search:$("inventorySearch").value.trim(),status:$("inventoryStatus").value,account_id:$("inventoryAccount").value,include_inactive:"true"});const response=await fetch("/api/v1/operator/mailboxes/export?"+params,{headers:{Authorization:"Bearer "+token}});if(!response.ok)throw Error("导出失败");const url=URL.createObjectURL(await response.blob());const link=document.createElement("a");link.href=url;link.download="icloud-mailboxes.csv";link.click();URL.revokeObjectURL(url);}catch(e){showToast(e.message,true);}};
 
-if (token) { $("loginView").classList.add("hidden");$("appView").classList.remove("hidden");Promise.all([loadOverview(),loadAccounts()]).catch(clearSession); }
+if (token) { $("loginView").classList.add("hidden");$("appView").classList.remove("hidden");Promise.all([loadOverview(),loadAccounts()]).then(startGenerationPolling).catch(clearSession); }

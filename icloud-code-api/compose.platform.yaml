@@ -1,34 +1,72 @@
+name: icloud-code-platform
+
+x-platform-runtime: &platform-runtime
+  build:
+    context: .
+    dockerfile: Dockerfile.platform
+  env_file:
+    - .env.platform
+  environment:
+    PLATFORM_HOST: "0.0.0.0"
+    PLATFORM_PORT: "8766"
+    PLATFORM_DATA_DIR: "/app/data/platform"
+    PLATFORM_HME_BRIDGE: "/app/python/hme_bridge.py"
+    PLATFORM_HME_PYTHON: "python"
+  volumes:
+    - ./data/platform:/app/data/platform
+  restart: unless-stopped
+
 services:
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile.platform
-    env_file:
-      - .env.platform
-    ports:
-      - "8766:8766"
-    volumes:
-      - platform-data:/app/data/platform
-    restart: unless-stopped
-    command: ["uvicorn", "platform_app:app", "--host", "0.0.0.0", "--port", "8766"]
+    <<: *platform-runtime
+    expose:
+      - "8766"
+    command:
+      [
+        "uvicorn",
+        "platform_app:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8766",
+        "--proxy-headers"
+      ]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/health', timeout=3)"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/health', timeout=3)"
+        ]
       interval: 30s
       timeout: 5s
+      start_period: 10s
       retries: 3
+
   worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.platform
-    env_file:
-      - .env.platform
-    volumes:
-      - platform-data:/app/data/platform
-    restart: unless-stopped
+    <<: *platform-runtime
     command: ["python", "platform_worker.py"]
     depends_on:
       api:
         condition: service_healthy
 
+  proxy:
+    image: caddy:2-alpine
+    environment:
+      CADDY_DOMAIN: "${CADDY_DOMAIN:-:80}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
-  platform-data:
+  caddy-data:
+  caddy-config:

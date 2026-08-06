@@ -57,6 +57,17 @@ $env:PLATFORM_MASTER_KEY = "与 API 进程相同的密钥"
 
 生产环境必须把 `PLATFORM_HOST` 设为 `0.0.0.0`，通过 HTTPS 反向代理暴露，并将 `PLATFORM_PUBLIC_ORIGIN` 设置为最终 HTTPS 域名。
 
+## Docker Compose 启动
+
+已提供 api、worker 和 Caddy proxy 的完整编排。首次配置和域名/数据迁移说明见 [DOCKER_DEPLOY.md](DOCKER_DEPLOY.md)。
+
+~~~powershell
+Copy-Item .env.platform.example .env.platform
+docker compose --env-file .env.platform -f compose.platform.yaml up -d --build
+~~~
+
+本地默认通过 http://127.0.0.1 访问；生产环境把 CADDY_DOMAIN 和 PLATFORM_PUBLIC_ORIGIN 改为实际域名。
+
 ## 客户 API
 
 注册或登录：
