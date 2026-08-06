@@ -166,7 +166,68 @@ function makeMailboxRow(mailbox) {
   cell=document.createElement("td");const actions=document.createElement("div");actions.className="actions";const add=(text,fn)=>{const b=document.createElement("button");b.className="button small";b.textContent=text;b.onclick=fn;actions.append(b);};add("状态",()=>openStatusModal(mailbox));add("历史",()=>showMessages(mailbox));add("发货",async()=>{try{const x=await api(`/api/v1/operator/mailboxes/${mailbox.id}/delivery`);showOutput("单个发货格式",x.delivery_line);loadInventory();}catch(e){showToast(e.message,true);}});add(mailbox.public_access_enabled?"重置链接":"生成链接",async()=>{try{const x=await api(`/api/v1/operator/mailboxes/${mailbox.id}/public-access`,{method:"POST",body:"{}"});showOutput("发货信息",`${x.delivery_line}\n\n查看页：\n${x.viewer_url}\n\n访问令牌：\n${x.token}`);loadInventory();}catch(e){showToast(e.message,true);}});cell.append(actions);row.append(cell);return row;
 }
 function openStatusModal(mailbox) {
-  openModal("修改邮箱状态",`<div class="form-grid"><label>状态<select data-status>${statusOptions("")}</select></label><label>客户ID（可选）<input data-customer class="input" value="${safe(mailbox.customer_id)}"></label><label>订单号（可选）<input data-order class="input" value="${safe(mailbox.order_no)}"></label><label>备注<textarea data-note>${safe(mailbox.note)}</textarea></label><div data-error class="error"></div></div><div class="form-actions"><button data-submit class="button primary"></button></div>`,"保存",async box=>{box.querySelector("[data-status]").value=mailbox.business_status;await api(`/api/v1/operator/mailboxes/${mailbox.id}/business`,{method:"PATCH",body:JSON.stringify({status:box.querySelector("[data-status]").value,customer_id:box.querySelector("[data-customer]").value,order_no:box.querySelector("[data-order]").value,note:box.querySelector("[data-note]").value})});closeModal();showToast("状态已更新");loadInventory();loadOverview();});
+  const currentStatus = Object.prototype.hasOwnProperty.call(statusLabels, mailbox.business_status) ? mailbox.business_status : "inventory";
+  const currentLabel = mailbox.business_status_label || statusLabels[currentStatus] || currentStatus;
+  const accountName = safe(mailbox.account_apple_id || "");
+  openModal("\u4fee\u6539\u90ae\u7bb1\u72b6\u6001", `<div class="status-form">
+    <div class="status-form-summary">
+      <div class="status-form-icon" aria-hidden="true">&#8599;</div>
+      <div class="status-form-summary-copy">
+        <span class="status-form-eyebrow">\u6b63\u5728\u7f16\u8f91\u90ae\u7bb1</span>
+        <strong>${safe(mailbox.email || "")}</strong>
+        ${accountName ? `<span class="status-form-account">${accountName}</span>` : ""}
+      </div>
+      <div class="status-form-current">
+        <span>\u5f53\u524d\u72b6\u6001</span>
+        <span data-status-preview class="status ${currentStatus}">${safe(currentLabel)}</span>
+      </div>
+    </div>
+    <div class="status-form-grid">
+      <div class="field field-full">
+        <label class="field-label" for="statusModalStatus">\u4e1a\u52a1\u72b6\u6001</label>
+        <select id="statusModalStatus" data-status class="select">${statusOptions("")}</select>
+        <small class="field-help">\u66f4\u65b0\u540e\u4f1a\u5f71\u54cd\u5e93\u5b58\u5206\u7c7b\u548c\u53d1\u8d27\u7b5b\u9009\u3002</small>
+      </div>
+      <div class="field">
+        <label class="field-label" for="statusModalCustomer">\u5ba2\u6237 ID <span>\u53ef\u9009</span></label>
+        <input id="statusModalCustomer" data-customer class="input" value="${safe(mailbox.customer_id)}" placeholder="\u8f93\u5165\u5ba2\u6237 ID">
+      </div>
+      <div class="field">
+        <label class="field-label" for="statusModalOrder">\u8ba2\u5355\u53f7 <span>\u53ef\u9009</span></label>
+        <input id="statusModalOrder" data-order class="input" value="${safe(mailbox.order_no)}" placeholder="\u8f93\u5165\u5173\u8054\u8ba2\u5355\u53f7">
+      </div>
+      <div class="field field-full">
+        <label class="field-label" for="statusModalNote">\u5907\u6ce8 <span>\u53ef\u9009</span></label>
+        <textarea id="statusModalNote" data-note class="input" rows="4" placeholder="\u8bb0\u5f55\u53d1\u8d27\u3001\u5ba2\u6237\u6216\u5176\u4ed6\u5907\u6ce8">${safe(mailbox.note)}</textarea>
+      </div>
+    </div>
+    <div data-error class="error" role="alert"></div>
+    <div class="form-actions"><button type="button" data-submit class="button primary"></button></div>
+  </div>`, "\u4fdd\u5b58", async box => {
+    const status = box.querySelector("[data-status]").value;
+    if (!status) throw Error("\u8bf7\u9009\u62e9\u4e1a\u52a1\u72b6\u6001");
+    await api(`/api/v1/operator/mailboxes/${mailbox.id}/business`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        status,
+        customer_id: box.querySelector("[data-customer]").value.trim(),
+        order_no: box.querySelector("[data-order]").value.trim(),
+        note: box.querySelector("[data-note]").value.trim(),
+      }),
+    });
+    closeModal(); showToast("\u72b6\u6001\u5df2\u66f4\u65b0"); loadInventory(); loadOverview();
+  });
+  const root = $("modalRoot");
+  const statusField = root.querySelector("[data-status]");
+  const preview = root.querySelector("[data-status-preview]");
+  statusField.value = currentStatus;
+  const updatePreview = () => {
+    const value = statusField.value || currentStatus;
+    preview.className = `status ${Object.prototype.hasOwnProperty.call(statusLabels, value) ? value : "off"}`;
+    preview.textContent = statusLabels[value] || value;
+  };
+  statusField.addEventListener("change", updatePreview);
+  updatePreview();
 }
 async function showMessages(mailbox) { try { const data=await api(`/api/v1/operator/mailboxes/${mailbox.id}/messages?limit=50`);const messages=data.messages||[];showOutput(`历史邮件 · ${mailbox.email}`,messages.length?messages.map(item=>`[${fmt(item.received_at)}] ${item.code?`验证码 ${item.code} · `:""}${item.subject||"无主题"}\n${item.preview||""}`).join("\n\n"):"暂无历史邮件"); } catch(error) { showToast(error.message,true); } }
 
