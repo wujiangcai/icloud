@@ -11,9 +11,16 @@ dist/
 # Local credentials, cookies, generated addresses, and runtime data
 icloud-code-api/config.json
 icloud-code-api/data/
+icloud-code-api/.env.platform
+icloud-code-api/.venv-platform/
 hidemyemail-generator/cookie.txt
 hidemyemail-generator/emails.txt
 hidemyemail-generator/data/
+
+# Environment files are local secrets; keep examples trackable
+.env*
+!.env.example
+!.env.platform.example
 
 # Runtime logs and local databases
 *.log

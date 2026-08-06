@@ -47,11 +47,14 @@ BROWSER_SESSION_LOG_PATH = GENERATOR_DATA_DIR / "browser-session.log"
 SCHEDULE_INTERVAL_MINUTES = 30
 SCHEDULE_INITIAL_COUNT = 4
 SCHEDULE_RECURRING_COUNT = 5
+MAX_REQUEST_BODY_BYTES = 1_048_576
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "host": "127.0.0.1",
     "port": 8765,
     "admin_key": "",
+    # Empty by default: same-origin/local clients do not need CORS.
+    "cors_origin": "",
     "imap": {
         "host": "imap.mail.me.com",
         "port": 993,
@@ -131,6 +134,8 @@ def load_config() -> dict[str, Any]:
         env_overrides["port"] = int(os.environ["ICLOUD_CODE_API_PORT"])
     if os.environ.get("ICLOUD_CODE_ADMIN_KEY"):
         env_overrides["admin_key"] = os.environ["ICLOUD_CODE_ADMIN_KEY"]
+    if os.environ.get("ICLOUD_CODE_API_CORS_ORIGIN"):
+        env_overrides["cors_origin"] = os.environ["ICLOUD_CODE_API_CORS_ORIGIN"].strip()
 
     imap_override: dict[str, Any] = {}
     if os.environ.get("ICLOUD_IMAP_HOST"):
@@ -147,6 +152,9 @@ def load_config() -> dict[str, Any]:
         env_overrides["imap"] = imap_override
 
     config = deep_merge(config, env_overrides)
+    # Never enable wildcard CORS for an API protected by bearer-style keys.
+    if str(config.get("cors_origin") or "").strip() == "*":
+        config["cors_origin"] = ""
     if not str(config.get("admin_key") or "").strip():
         config["admin_key"] = get_or_create_generated_admin_key()
     return config
@@ -1238,11 +1246,22 @@ def dashboard_payload() -> dict[str, Any]:
             row["alias_id"]: dict(row)
             for row in conn.execute(
                 """
+                WITH ranked AS (
+                    SELECT
+                        alias_id,
+                        code,
+                        subject,
+                        received_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY alias_id
+                            ORDER BY datetime(received_at) DESC, id DESC
+                        ) AS row_number
+                      FROM messages
+                     WHERE alias_id IS NOT NULL AND code != ''
+                )
                 SELECT alias_id, code, subject, received_at
-                  FROM messages
-                 WHERE alias_id IS NOT NULL AND code != ''
-                 GROUP BY alias_id
-                 ORDER BY received_at DESC
+                  FROM ranked
+                 WHERE row_number = 1
                 """
             ).fetchall()
         }
@@ -1759,6 +1778,7 @@ ADMIN_HTML = r"""<!doctype html>
         const id = String(a.id);
         const checked = aliasState.selectedIds.has(id) ? "checked" : "";
         const endpoint = endpointForAlias(a);
+        const credential = a.credential || [a.email, a.api_key].join("----");
         const latest = a.latest_code && a.latest_code.code ? `${esc(a.latest_code.code)} <span class="muted mono">${esc(a.latest_code.received_at || "")}</span>` : "-";
         return `<tr>
           <td class="tight"><input class="aliasSelect" type="checkbox" data-id="${esc(id)}" ${checked} /></td>
@@ -1767,19 +1787,38 @@ ADMIN_HTML = r"""<!doctype html>
           <td>${esc(a.label || "")}</td>
           <td class="mono">
             <span>${esc(a.api_key)}</span><br>
-            <button onclick="copy('${esc(a.credential)}')">复制凭据</button>
-            <button onclick="copy('${esc(endpoint)}')">复制接口</button>
+            <button data-copy-value="${esc(credential)}">复制凭据</button>
+            <button data-copy-value="${esc(endpoint)}">复制接口</button>
           </td>
           <td class="mono">${latest}</td>
           <td><span class="pill">${a.message_count || 0}</span></td>
           <td>
-            <button onclick="rotateAlias(${a.id})">换 Key</button>
-            <button class="danger" onclick="deleteAlias(${a.id})">删除</button>
+            <button data-rotate-id="${esc(id)}">换 Key</button>
+            <button class="danger" data-delete-id="${esc(id)}">删除</button>
           </td>
         </tr>`;
       }).join("");
       bindAliasCheckboxes();
+      bindAliasActions();
     }
+
+    const bindAliasActions = () => {
+      document.querySelectorAll("[data-copy-value]").forEach((button) => {
+        button.onclick = () => copy(button.dataset.copyValue || "").catch((error) => {
+          toast("aliasExportToast", error.message || "copy failed", false);
+        });
+      });
+      document.querySelectorAll("[data-rotate-id]").forEach((button) => {
+        button.onclick = () => rotateAlias(Number(button.dataset.rotateId)).catch((error) => {
+          toast("aliasExportToast", error.message || "key update failed", false);
+        });
+      });
+      document.querySelectorAll("[data-delete-id]").forEach((button) => {
+        button.onclick = () => deleteAlias(Number(button.dataset.deleteId)).catch((error) => {
+          toast("aliasExportToast", error.message || "delete failed", false);
+        });
+      });
+    };
 
     async function loadMessages() {
       const alias = $("messageAlias").value;
@@ -1925,6 +1964,12 @@ ADMIN_HTML = r"""<!doctype html>
 </html>"""
 
 
+class RequestBodyError(ValueError):
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 class ApiHandler(BaseHTTPRequestHandler):
     server_version = "IcloudCodeApi/0.1"
 
@@ -1932,9 +1977,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), fmt % args))
 
     def end_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        # CORS is opt-in. The previous wildcard policy allowed any web page
+        # that obtained an API key to read protected responses.
+        origin = self.headers.get("Origin", "").strip()
+        allowed_origin = str(current_config().get("cors_origin") or "").strip()
+        if allowed_origin and origin == allowed_origin:
+            self.send_header("Access-Control-Allow-Origin", allowed_origin)
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+            self.send_header("Vary", "Origin")
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
@@ -1955,8 +2006,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or "0")
-        if length <= 0:
+        raw_length = self.headers.get("Content-Length")
+        if not raw_length:
+            return {}
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError) as error:
+            raise RequestBodyError("invalid Content-Length", HTTPStatus.BAD_REQUEST) from error
+        if length < 0:
+            raise RequestBodyError("invalid Content-Length", HTTPStatus.BAD_REQUEST)
+        if length > MAX_REQUEST_BODY_BYTES:
+            raise RequestBodyError(
+                f"request body exceeds {MAX_REQUEST_BODY_BYTES} bytes",
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
+        if length == 0:
             return {}
         raw = self.rfile.read(length)
         try:
@@ -1989,6 +2053,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             return True
         self.send_json({"ok": False, "error": "Admin API Key 不正确"}, HTTPStatus.UNAUTHORIZED)
         return False
+
+    def send_internal_error(self, error: Exception) -> None:
+        self.log_message("internal error: %s", error)
+        self.send_json({"ok": False, "error": "Internal server error"}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
@@ -2113,11 +2181,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             self.send_json({"ok": False, "error": "Not found"}, HTTPStatus.NOT_FOUND)
         except Exception as err:
-            self.send_json({"ok": False, "error": str(err)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.send_internal_error(err)
 
     def do_POST(self) -> None:
         path, query = self.path_parts()
-        body = self.read_json()
+        try:
+            body = self.read_json()
+        except RequestBodyError as error:
+            self.send_json({"ok": False, "error": str(error)}, error.status)
+            return
         try:
             if path == "/api/schedule/action":
                 if not self.require_admin(query, body):
@@ -2263,7 +2335,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             self.send_json({"ok": False, "error": "Not found"}, HTTPStatus.NOT_FOUND)
         except Exception as err:
-            self.send_json({"ok": False, "error": str(err)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.send_internal_error(err)
 
     def do_DELETE(self) -> None:
         path, query = self.path_parts()
@@ -2284,7 +2356,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             self.send_json({"ok": False, "error": "Not found"}, HTTPStatus.NOT_FOUND)
         except Exception as err:
-            self.send_json({"ok": False, "error": str(err)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.send_internal_error(err)
 
 
 def main() -> None:

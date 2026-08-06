@@ -27,6 +27,8 @@ DATA_DIR = API_DIR / "data"
 STATE_PATH = DATA_DIR / "hme_schedule_state.json"
 LOCK_PATH = DATA_DIR / "hme_schedule.lock"
 LOG_PATH = DATA_DIR / "hme_schedule.log"
+LOCK_STALE_SECONDS = 2 * 60 * 60
+_lock_descriptor: int | None = None
 
 
 def now_iso() -> str:
@@ -52,29 +54,82 @@ def write_state(state: dict[str, object]) -> None:
     temporary.replace(STATE_PATH)
 
 
-def acquire_lock() -> bool:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+def _lock_pid() -> int | None:
     try:
-        descriptor = os.open(
-            LOCK_PATH,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-            0o600,
-        )
-    except FileExistsError:
-        try:
-            if time.time() - LOCK_PATH.stat().st_mtime > 2 * 60 * 60:
-                LOCK_PATH.unlink()
-                return acquire_lock()
-        except OSError:
-            pass
-        return False
+        content = LOCK_PATH.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    match = re.search(r"(?m)^pid=(\d+)\s*$", content)
+    return int(match.group(1)) if match else None
 
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        handle.write(f"pid={os.getpid()}\nstarted={now_iso()}\n")
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        # On Windows os.kill(pid, 0) reports a range of Win32 errors for
+        # an already exited process. PermissionError is handled above;
+        # an ordinary OSError here is treated as not running. Avoid a
+        # ctypes probe because it can hang in restricted environments.
+        return False
     return True
 
 
+def acquire_lock() -> bool:
+    global _lock_descriptor
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            descriptor = os.open(
+                LOCK_PATH,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError:
+            try:
+                pid = _lock_pid()
+                age = max(0.0, time.time() - LOCK_PATH.stat().st_mtime)
+                # A live owner is authoritative even after a long run.  Old
+                # versions only checked mtime, so one slow job could be
+                # mistaken for a stale lock forever after the next launch.
+                if pid is not None and _pid_is_running(pid):
+                    return False
+                if pid is None and age <= LOCK_STALE_SECONDS:
+                    return False
+                LOCK_PATH.unlink()
+            except OSError:
+                return False
+            continue
+
+        try:
+            os.write(descriptor, f"pid={os.getpid()}\nstarted={now_iso()}\n".encode("utf-8"))
+            os.fsync(descriptor)
+        except OSError:
+            os.close(descriptor)
+            try:
+                LOCK_PATH.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        _lock_descriptor = descriptor
+        return True
+
+
 def release_lock() -> None:
+    global _lock_descriptor
+    descriptor = _lock_descriptor
+    _lock_descriptor = None
+    if descriptor is not None:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
     try:
         LOCK_PATH.unlink()
     except FileNotFoundError:
@@ -103,6 +158,29 @@ def append_log(text: str) -> None:
         handle.write(safe_log_text(text))
         if not text.endswith("\n"):
             handle.write("\n")
+
+
+def terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    """Stop a timed-out generator and any browser children it started."""
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=10,
+            )
+            if process.poll() is not None:
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
 
 
 def run_once(
@@ -158,30 +236,44 @@ def run_once(
             **os.environ,
             "HME_MAX_FAILURES": str(max(0, max_failures)),
         }
+        creationflags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            if os.name == "nt"
+            else 0
+        )
+        process = subprocess.Popen(
+            command,
+            cwd=str(API_DIR),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creationflags,
+        )
         try:
-            completed = subprocess.run(
-                command,
-                cwd=str(API_DIR),
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=max(1, timeout_minutes) * 60,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
+            output, _ = process.communicate(timeout=max(1, timeout_minutes) * 60)
+        except subprocess.TimeoutExpired:
+            terminate_process_tree(process)
+            try:
+                output, _ = process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                output, _ = process.communicate()
             append_log(
                 f"[{now_iso()}] timed out after {timeout_minutes} minutes\n"
-                + (exc.stdout or "")
+                + (output or "")
             )
             return 1
 
-        append_log(completed.stdout or "")
-        if completed.returncode != 0:
-            append_log(f"[{now_iso()}] run failed: exit={completed.returncode}\n")
-            return completed.returncode
+        append_log(output or "")
+        if process.returncode != 0:
+            append_log(f"[{now_iso()}] run failed: exit={process.returncode}\n")
+            return process.returncode
 
         state.update(
             {

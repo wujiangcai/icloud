@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#f5f7fb">
+  <title>验证码收件箱</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --panel: rgba(255,255,255,.9);
+      --panel-solid: #fff;
+      --text: #101828;
+      --muted: #667085;
+      --faint: #98a2b3;
+      --line: #e6eaf0;
+      --accent: #635bff;
+      --accent-strong: #4f46e5;
+      --accent-soft: #eeecff;
+      --success: #039855;
+      --success-soft: #e8f8f0;
+      --warning: #b54708;
+      --warning-soft: #fff4e5;
+      --danger: #d92d20;
+      --danger-soft: #fff0ee;
+      --shadow: 0 24px 70px rgba(16,24,40,.09);
+    }
+    [data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #0d111b;
+      --panel: rgba(20,27,42,.9);
+      --panel-solid: #141b2a;
+      --text: #f2f4f7;
+      --muted: #aab4c4;
+      --faint: #7d899d;
+      --line: #293449;
+      --accent: #8b84ff;
+      --accent-strong: #a49fff;
+      --accent-soft: #27244d;
+      --success: #58d69a;
+      --success-soft: #163a2a;
+      --warning: #fdb022;
+      --warning-soft: #3c2c14;
+      --danger: #ff8b82;
+      --danger-soft: #401d20;
+      --shadow: 0 24px 70px rgba(0,0,0,.28);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 12% 0%, rgba(99,91,255,.13), transparent 34rem),
+        radial-gradient(circle at 88% 10%, rgba(20,184,166,.10), transparent 30rem),
+        var(--bg);
+      font: 15px/1.55 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    button { font: inherit; }
+    .page { max-width: 920px; margin: 0 auto; padding: 24px 18px 48px; }
+    .topbar { display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:28px; }
+    .brand { display:flex; align-items:center; gap:12px; min-width:0; }
+    .brand-mark { width:42px; height:42px; display:grid; place-items:center; border-radius:14px; color:#fff; background:linear-gradient(135deg,#7c72ff,#4f46e5); box-shadow:0 10px 24px rgba(79,70,229,.25); flex:0 0 auto; }
+    .brand-mark svg { width:22px; height:22px; }
+    .brand-copy { min-width:0; }
+    .brand-copy strong { display:block; font-size:15px; letter-spacing:.01em; }
+    .brand-copy span { display:block; color:var(--muted); font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .top-actions { display:flex; gap:8px; align-items:center; }
+    .icon-btn, .ghost-btn, .primary-btn { border:1px solid var(--line); border-radius:11px; cursor:pointer; transition:.18s ease; }
+    .icon-btn { width:40px; height:40px; display:grid; place-items:center; color:var(--muted); background:var(--panel); }
+    .icon-btn:hover, .ghost-btn:hover { border-color:var(--accent); color:var(--accent); transform:translateY(-1px); }
+    .icon-btn svg { width:18px; height:18px; }
+    .hero { position:relative; overflow:hidden; padding:30px; border:1px solid rgba(129,117,255,.18); border-radius:24px; background:linear-gradient(135deg,rgba(255,255,255,.94),rgba(245,243,255,.88)); box-shadow:var(--shadow); }
+    [data-theme="dark"] .hero { background:linear-gradient(135deg,rgba(28,27,63,.96),rgba(20,27,42,.92)); }
+    .hero::after { content:""; position:absolute; width:240px; height:240px; right:-78px; top:-100px; border-radius:50%; background:rgba(129,117,255,.16); filter:blur(2px); }
+    .eyebrow { color:var(--accent-strong); font-size:12px; font-weight:750; letter-spacing:.12em; text-transform:uppercase; }
+    .hero h1 { margin:8px 0 8px; font-size:clamp(25px,5vw,40px); line-height:1.16; letter-spacing:-.04em; max-width:620px; }
+    .hero p { max-width:640px; margin:0; color:var(--muted); }
+    .mail-chip { display:inline-flex; align-items:center; gap:8px; max-width:100%; margin-top:20px; padding:9px 13px; color:var(--text); border:1px solid var(--line); border-radius:999px; background:var(--panel-solid); font-weight:650; }
+    .mail-chip span { max-width:calc(100vw - 90px); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .mail-chip svg { width:16px; height:16px; color:var(--accent); flex:0 0 auto; }
+    .panel { margin-top:16px; padding:22px; border:1px solid var(--line); border-radius:20px; background:var(--panel); box-shadow:0 14px 40px rgba(16,24,40,.045); backdrop-filter:blur(14px); }
+    .panel-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+    .panel-title { margin:0; font-size:16px; }
+    .panel-subtitle { margin:3px 0 0; color:var(--muted); font-size:13px; }
+    .status-line { display:flex; align-items:center; gap:7px; color:var(--muted); font-size:12px; }
+    .dot { width:8px; height:8px; border-radius:50%; background:var(--faint); box-shadow:0 0 0 4px rgba(152,162,179,.13); }
+    .dot.live { background:var(--success); box-shadow:0 0 0 4px rgba(3,152,85,.14); }
+    .dot.warn { background:var(--warning); box-shadow:0 0 0 4px rgba(181,71,8,.14); }
+    .code-panel { margin-top:18px; padding:22px; border:1px solid rgba(99,91,255,.2); border-radius:18px; background:linear-gradient(135deg,var(--accent-soft),transparent); text-align:center; }
+    .code-label { color:var(--muted); font-size:12px; font-weight:650; letter-spacing:.04em; }
+    .code { min-height:68px; display:flex; align-items:center; justify-content:center; margin:8px 0 14px; color:var(--accent-strong); font:750 clamp(35px,9vw,62px)/1.1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing:.15em; word-break:break-all; }
+    .code.waiting { color:var(--muted); font:650 20px/1.4 Inter,ui-sans-serif,system-ui,sans-serif; letter-spacing:0; }
+    .code.received { color:var(--warning); font:650 20px/1.4 Inter,ui-sans-serif,system-ui,sans-serif; letter-spacing:0; }
+    .action-row { display:flex; justify-content:center; gap:9px; flex-wrap:wrap; }
+    .primary-btn, .ghost-btn { min-height:40px; padding:9px 15px; }
+    .primary-btn { color:#fff; border-color:transparent; background:linear-gradient(135deg,var(--accent),var(--accent-strong)); box-shadow:0 8px 18px rgba(79,70,229,.2); }
+    .primary-btn:hover { transform:translateY(-1px); filter:brightness(1.04); }
+    .ghost-btn { color:var(--text); background:var(--panel-solid); }
+    .primary-btn svg, .ghost-btn svg { width:16px; height:16px; vertical-align:-3px; margin-right:5px; }
+    .mail-meta { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:18px; }
+    .meta { min-width:0; padding:12px; border:1px solid var(--line); border-radius:13px; background:var(--panel-solid); }
+    .meta label { display:block; margin-bottom:4px; color:var(--muted); font-size:11px; }
+    .meta strong { display:block; overflow:hidden; color:var(--text); font-size:13px; text-overflow:ellipsis; white-space:nowrap; }
+    .history-list { display:grid; gap:10px; margin-top:18px; }
+    .history-item { padding:14px; border:1px solid var(--line); border-radius:14px; background:var(--panel-solid); }
+    .history-top { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+    .history-subject { min-width:0; overflow:hidden; font-weight:700; text-overflow:ellipsis; white-space:nowrap; }
+    .history-time { color:var(--muted); font-size:11px; white-space:nowrap; }
+    .history-meta { margin-top:4px; color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .history-preview { margin-top:9px; color:var(--muted); font-size:12px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .history-bottom { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:10px; }
+    .history-code { color:var(--accent-strong); font:750 18px/1.2 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; letter-spacing:.08em; }
+    .history-copy { min-height:32px; padding:6px 10px; color:var(--accent-strong); border:1px solid rgba(99,91,255,.24); border-radius:9px; background:var(--accent-soft); cursor:pointer; font-size:12px; }
+    .history-empty { padding:22px 14px; color:var(--muted); border:1px dashed var(--line); border-radius:14px; text-align:center; }
+    .history-more { display:block; width:100%; margin-top:12px; }
+    .empty-mail { display:flex; align-items:center; gap:13px; padding:16px; margin-top:18px; border:1px dashed var(--line); border-radius:14px; color:var(--muted); }
+    .empty-mail-icon { width:36px; height:36px; display:grid; place-items:center; border-radius:11px; background:var(--accent-soft); color:var(--accent); flex:0 0 auto; }
+    .empty-mail-icon svg { width:18px; height:18px; }
+    .error { padding:14px 16px; margin-top:18px; border:1px solid rgba(217,45,32,.22); border-radius:14px; color:var(--danger); background:var(--danger-soft); }
+    .footer { padding:20px 4px 0; display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:12px; }
+    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+    @media (max-width:640px) { .page{padding:16px 12px 34px}.topbar{margin-bottom:18px}.hero{padding:22px 18px;border-radius:20px}.panel{padding:16px;border-radius:17px}.mail-meta{grid-template-columns:1fr}.history-top{display:block}.history-time{display:block;margin-top:3px}.history-bottom{align-items:flex-start}.brand-copy span{max-width:190px}.footer{padding-top:16px} }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7.5A2.5 2.5 0 0 1 6.5 5h11A2.5 2.5 0 0 1 20 7.5v9a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 16.5v-9Z" stroke="currentColor" stroke-width="1.8"/><path d="m5 7 7 5 7-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="brand-copy"><strong>验证码收件箱</strong><span>安全、清晰、只显示你需要的验证码</span></div>
+      </div>
+      <div class="top-actions">
+        <button id="themeBtn" class="icon-btn" type="button" aria-label="切换主题"><svg viewBox="0 0 24 24" fill="none"><path d="M20.3 15.3A8.5 8.5 0 0 1 8.7 3.7 8.5 8.5 0 1 0 20.3 15.3Z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
+        <button id="refreshTop" class="icon-btn" type="button" aria-label="刷新"><svg viewBox="0 0 24 24" fill="none"><path d="M20 11a8 8 0 0 0-14.9-3.9L3 10m0 0V5m0 5h5M4 13a8 8 0 0 0 14.9 3.9L21 14m0 0v5m0-5h-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      </div>
+    </header>
+
+    <section class="hero">
+      <div class="eyebrow">Secure mailbox</div>
+      <h1>验证码会出现在这里</h1>
+      <p>页面会自动检查最新邮件。你只需要复制验证码，不需要输入邮箱密码，也不会看到邮箱的内部凭据。</p>
+      <div class="mail-chip"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7.5A2.5 2.5 0 0 1 6.5 5h11A2.5 2.5 0 0 1 20 7.5v9a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 16.5v-9Z" stroke="currentColor" stroke-width="1.8"/><path d="m5 7 7 5 7-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span id="emailLabel">正在读取邮箱…</span></div>
+    </section>
+
+    <section class="panel" aria-live="polite">
+      <div class="panel-head">
+        <div><h2 class="panel-title">最新验证码</h2><p class="panel-subtitle" id="refreshHint">正在连接收件箱…</p></div>
+        <div class="status-line"><span id="statusDot" class="dot"></span><span id="statusText">连接中</span></div>
+      </div>
+      <div id="errorBox" class="error" hidden></div>
+      <div id="codePanel" class="code-panel" hidden>
+        <div class="code-label">ONE-TIME CODE</div>
+        <div id="codeValue" class="code waiting">等待新邮件</div>
+        <div class="action-row"><button id="copyBtn" class="primary-btn" type="button" disabled><svg viewBox="0 0 24 24" fill="none"><rect x="8" y="8" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M16 8V6.5A2.5 2.5 0 0 0 13.5 4h-7A2.5 2.5 0 0 0 4 6.5v7A2.5 2.5 0 0 0 6.5 16H8" stroke="currentColor" stroke-width="1.8"/></svg>复制验证码</button><button id="refreshBtn" class="ghost-btn" type="button"><svg viewBox="0 0 24 24" fill="none"><path d="M20 11a8 8 0 0 0-14.9-3.9L3 10m0 0V5m0 5h5M4 13a8 8 0 0 0 14.9 3.9L21 14m0 0v5m0-5h-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>立即刷新</button></div>
+      </div>
+      <div id="emptyMail" class="empty-mail" hidden><div class="empty-mail-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7.5A2.5 2.5 0 0 1 6.5 5h11A2.5 2.5 0 0 1 20 7.5v9a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 16.5v-9Z" stroke="currentColor" stroke-width="1.8"/><path d="m5 7 7 5 7-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div><strong>还没有新的邮件</strong><div>保持此页面打开，收到邮件后会自动显示。</div></div></div>
+      <div id="mailMeta" class="mail-meta" hidden><div class="meta"><label>邮件主题</label><strong id="subjectValue">—</strong></div><div class="meta"><label>发件人</label><strong id="fromValue">—</strong></div><div class="meta"><label>收到时间</label><strong id="timeValue">—</strong></div></div>
+    </section>
+    <section class="panel" aria-live="polite">
+      <div class="panel-head"><div><h2 class="panel-title">历史邮件</h2><p class="panel-subtitle">已同步到平台的邮件记录，验证码会保留在历史列表中。</p></div><button id="historyRefresh" class="ghost-btn" type="button">刷新记录</button></div>
+      <div id="historyList" class="history-list"><div class="history-empty">正在读取历史邮件…</div></div>
+      <button id="historyMore" class="ghost-btn history-more" type="button" hidden>加载更早邮件</button>
+    </section>
+    <footer class="footer"><span>自动刷新倒计时：<b id="countdown">15</b> 秒</span><span>请勿分享此接码地址</span></footer>
+  </main>
+
+  <script>
+    (() => {
+      const $ = (id) => document.getElementById(id);
+      const token = decodeURIComponent(location.pathname.split('/').filter(Boolean).pop() || '');
+      const endpoint = '/api/v1/public/mail/' + encodeURIComponent(token) + '/latest';
+      const root = document.documentElement;
+      let currentCode = '';
+      let seconds = 15;
+      let busy = false;
+      let historyBefore = 0;
+      let historyBusy = false;
+
+      const setTheme = (theme) => { root.dataset.theme = theme; localStorage.setItem('code-viewer-theme', theme); };
+      setTheme(localStorage.getItem('code-viewer-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+      $('themeBtn').onclick = () => setTheme(root.dataset.theme === 'dark' ? 'light' : 'dark');
+
+      const setStatus = (text, kind) => { $('statusText').textContent = text; $('statusDot').className = 'dot ' + (kind || ''); };
+      const formatTime = (value) => value ? new Date(value).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '—';
+      const setError = (text) => { $('errorBox').textContent = text; $('errorBox').hidden = !text; };
+      const resetTimer = () => { seconds = 15; $('countdown').textContent = seconds; };
+      const render = (data) => {
+        $('emailLabel').textContent = data.email || '验证码邮箱';
+        const mail = data.mail;
+        const code = String(data.code || '').trim();
+        currentCode = code;
+        $('codePanel').hidden = false;
+        $('mailMeta').hidden = !mail;
+        $('emptyMail').hidden = !!mail;
+        $('copyBtn').disabled = !code;
+        $('codeValue').textContent = code || (mail ? '邮件已到达，未识别到验证码' : '等待新邮件');
+        $('codeValue').className = 'code ' + (code ? '' : (mail ? 'received' : 'waiting'));
+        $('subjectValue').textContent = mail?.subject || '无主题';
+        $('fromValue').textContent = mail?.from || '未知发件人';
+        $('timeValue').textContent = formatTime(mail?.received_at);
+        $('refreshHint').textContent = mail ? '已显示最近一封邮件 · 页面会持续检查更新' : '暂时没有新邮件 · 页面会持续检查更新';
+        setStatus(code ? '已收到验证码' : (mail ? '邮件已到达' : '等待邮件'), code ? 'live' : 'warn');
+      };
+      const renderHistory = (messages, append = false) => {
+        const list = $('historyList');
+        if (!append) list.textContent = '';
+        if (!messages.length && !append) {
+          list.innerHTML = '<div class="history-empty">暂时没有已同步的历史邮件</div>';
+          return;
+        }
+        messages.forEach((message) => {
+          const item = document.createElement('article');
+          item.className = 'history-item';
+          const top = document.createElement('div');
+          top.className = 'history-top';
+          const subject = document.createElement('div');
+          subject.className = 'history-subject';
+          subject.textContent = message.subject || '无主题';
+          const time = document.createElement('time');
+          time.className = 'history-time';
+          time.textContent = formatTime(message.received_at);
+          top.append(subject, time);
+          const meta = document.createElement('div');
+          meta.className = 'history-meta';
+          meta.textContent = message.from || '未知发件人';
+          const preview = document.createElement('div');
+          preview.className = 'history-preview';
+          preview.textContent = message.preview || '没有可显示的邮件正文摘要';
+          const bottom = document.createElement('div');
+          bottom.className = 'history-bottom';
+          const code = document.createElement('strong');
+          code.className = 'history-code';
+          code.textContent = message.code ? '验证码：' + message.code : '未识别验证码';
+          bottom.append(code);
+          if (message.code) {
+            const copy = document.createElement('button');
+            copy.className = 'history-copy';
+            copy.type = 'button';
+            copy.textContent = '复制验证码';
+            copy.onclick = async () => {
+              try { await navigator.clipboard.writeText(message.code); copy.textContent = '已复制'; }
+              catch (_) { copy.textContent = '请手动复制'; }
+              setTimeout(() => { copy.textContent = '复制验证码'; }, 1400);
+            };
+            bottom.append(copy);
+          }
+          item.append(top, meta, preview, bottom);
+          list.append(item);
+        });
+      };
+      const load = async () => {
+        if (busy) return;
+        busy = true;
+        setError('');
+        $('refreshBtn').disabled = true;
+        $('refreshTop').disabled = true;
+        try {
+          const response = await fetch(endpoint, { cache: 'no-store', headers: { Accept: 'application/json' } });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(data.detail || '接码地址已失效');
+          render(data);
+          historyBefore = data.next_before || 0;
+          renderHistory(Array.isArray(data.messages) ? data.messages : []);
+          $('historyMore').hidden = !data.has_more;
+        } catch (error) {
+          $('codePanel').hidden = true;
+          $('emptyMail').hidden = true;
+          $('mailMeta').hidden = true;
+          $('historyMore').hidden = true;
+          $('historyList').innerHTML = '<div class="history-empty">历史邮件暂时无法读取</div>';
+          setStatus('连接失败', '');
+          setError(error.message || '暂时无法读取邮件，请稍后重试');
+          $('refreshHint').textContent = '请点击刷新重新连接';
+        } finally {
+          busy = false;
+          $('refreshBtn').disabled = false;
+          $('refreshTop').disabled = false;
+          resetTimer();
+        }
+      };
+      const loadMoreHistory = async () => {
+        if (historyBusy || !historyBefore) return;
+        historyBusy = true;
+        $('historyMore').disabled = true;
+        try {
+          const url = endpoint.replace(/\/latest$/, '/messages') + '?limit=50&before=' + encodeURIComponent(historyBefore);
+          const response = await fetch(url, { cache: 'no-store', headers: { Accept: 'application/json' } });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(data.detail || '历史邮件读取失败');
+          renderHistory(Array.isArray(data.messages) ? data.messages : [], true);
+          historyBefore = data.next_before || 0;
+          $('historyMore').hidden = !data.has_more;
+        } catch (error) {
+          $('historyMore').textContent = error.message || '加载失败，点击重试';
+        } finally {
+          historyBusy = false;
+          $('historyMore').disabled = false;
+          if (!$('historyMore').hidden) $('historyMore').textContent = '加载更早邮件';
+        }
+      };
+      const copyCode = async () => {
+        if (!currentCode) return;
+        try {
+          await navigator.clipboard.writeText(currentCode);
+          $('copyBtn').textContent = '已复制验证码';
+        } catch (_) { $('copyBtn').textContent = '请手动复制'; }
+        setTimeout(() => { $('copyBtn').innerHTML = '<svg viewBox="0 0 24 24" fill="none"><rect x="8" y="8" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M16 8V6.5A2.5 2.5 0 0 0 13.5 4h-7A2.5 2.5 0 0 0 4 6.5v7A2.5 2.5 0 0 0 6.5 16H8" stroke="currentColor" stroke-width="1.8"/></svg>复制验证码'; }, 1400);
+      };
+      $('refreshBtn').onclick = load;
+      $('refreshTop').onclick = load;
+      $('historyRefresh').onclick = load;
+      $('historyMore').onclick = loadMoreHistory;
+      $('copyBtn').onclick = copyCode;
+      load();
+      setInterval(() => { seconds = Math.max(0, seconds - 1); $('countdown').textContent = seconds; if (seconds === 0) load(); }, 1000);
+    })();
+  </script>
+</body>
+</html>

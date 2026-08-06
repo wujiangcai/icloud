@@ -23,6 +23,21 @@ REQUEST_TIMEOUT_SECONDS = int(os.environ.get("HME_REQUEST_TIMEOUT_SECONDS", "30"
 REQUEST_RETRIES = max(1, int(os.environ.get("HME_REQUEST_RETRIES", "2")))
 
 
+def _is_limit_error(value: object) -> bool:
+    text = str(value or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "rate limit",
+            "too many request",
+            "quota",
+            "limit exceeded",
+            "throttl",
+            "429",
+        )
+    )
+
+
 class HideMyEmail:
     REGION_CONFIG = {
         "global": {
@@ -256,6 +271,11 @@ class HideMyEmail:
                 if raw_error == 1:
                     raw_error = "Apple rejected the iCloud session (error=1)"
                 last_error = str(raw_error or f"HTTP {resp.status}")
+                # Do not fall back from POST to GET after Apple has applied a
+                # quota/rate limit; another request only extends the block.
+                if resp.status == 429 or _is_limit_error(last_error):
+                    self._context_error = last_error
+                    return
                 continue
 
             ds_info = data.get("dsInfo") or {}
@@ -278,20 +298,29 @@ class HideMyEmail:
         self._context_error = last_error or "Unable to validate iCloud session"
 
     async def _request_json(self, method: str, url: str, **kwargs) -> dict:
-        for attempt in range(REQUEST_RETRIES):
+        method = method.upper()
+        # POST creates or reserves an alias.  Retrying it after a timeout can
+        # create a second alias because the server may have committed the
+        # first request before the client lost its connection.
+        attempts = 1 if method in {"POST", "PUT", "PATCH", "DELETE"} else REQUEST_RETRIES
+        for attempt in range(attempts):
             try:
                 async with self.s.request(method, url, **kwargs) as resp:
                     data = await resp.json(content_type=None)
                     if isinstance(data, dict):
                         if resp.status >= 400 and not data.get("reason"):
                             data = {**data, "reason": f"HTTP {resp.status}"}
+                        # Apple rate-limit responses are terminal for this
+                        # operation; never retry them as if they were transient.
+                        if resp.status == 429 or _is_limit_error(data.get("reason") or data.get("error")):
+                            return data
                         return data
                     return {"error": 1, "reason": f"Unexpected response ({resp.status})"}
             except asyncio.TimeoutError:
-                if attempt == REQUEST_RETRIES - 1:
+                if attempt == attempts - 1:
                     return {"error": 1, "reason": f"Request timed out after {REQUEST_TIMEOUT_SECONDS}s"}
             except Exception as exc:
-                if attempt == REQUEST_RETRIES - 1:
+                if attempt == attempts - 1:
                     return {"error": 1, "reason": str(exc)}
         return {"error": 1, "reason": "Request failed"}
 

@@ -1,0 +1,34 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.platform
+    env_file:
+      - .env.platform
+    ports:
+      - "8766:8766"
+    volumes:
+      - platform-data:/app/data/platform
+    restart: unless-stopped
+    command: ["uvicorn", "platform_app:app", "--host", "0.0.0.0", "--port", "8766"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.platform
+    env_file:
+      - .env.platform
+    volumes:
+      - platform-data:/app/data/platform
+    restart: unless-stopped
+    command: ["python", "platform_worker.py"]
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  platform-data:
