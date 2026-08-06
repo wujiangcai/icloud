@@ -110,7 +110,8 @@ def _extract_maildomain_host(text: str) -> str:
 
 
 def _select_cookie_and_host(text: str, normalized: str) -> tuple[str, str]:
-    preferred: list[tuple[str, str]] = []
+    hme_preferred: list[tuple[str, str]] = []
+    maildomain_preferred: list[tuple[str, str]] = []
     fallback: list[tuple[str, str]] = []
     for block in _curl_blocks(normalized):
         cookie = _extract_cookie_from_block(block)
@@ -118,12 +119,16 @@ def _select_cookie_and_host(text: str, normalized: str) -> tuple[str, str]:
             continue
         host = _extract_maildomain_host(block)
         item = (cookie, host)
-        if host:
-            preferred.append(item)
+        if host and re.search(r"(?i)/v[12]/hme/", block):
+            hme_preferred.append(item)
+        elif host:
+            maildomain_preferred.append(item)
         else:
             fallback.append(item)
-    if preferred:
-        return preferred[-1]
+    if hme_preferred:
+        return hme_preferred[-1]
+    if maildomain_preferred:
+        return maildomain_preferred[-1]
     if fallback:
         return fallback[0]
     return "", ""

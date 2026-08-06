@@ -28,6 +28,18 @@ curl --url 'https://p188-maildomainws.icloud.com/v2/hme/list?clientBuildNumber=2
             "2628Build27",
         )
 
+    def test_hme_request_wins_over_later_domain_request(self):
+        fixture = r"""
+curl --url 'https://p188-maildomainws.icloud.com/v2/hme/list?clientBuildNumber=2628Build27' -b 'X-APPLE-WEBAUTH-USER=hme'
+curl --url 'https://p188-maildomainws.icloud.com/v2/domain/list?clientBuildNumber=2628Build27' -b 'X-APPLE-WEBAUTH-USER=domain'
+"""
+
+        cookie, region, host = bridge.parse_cookie_context(fixture, "auto")
+
+        self.assertEqual(cookie, "X-APPLE-WEBAUTH-USER=hme")
+        self.assertEqual(region, "global")
+        self.assertEqual(host, "p188-maildomainws.icloud.com")
+
     def test_default_shard_can_recover_from_user_partition(self):
         self.assertEqual(
             bridge._candidate_maildomain_hosts(
