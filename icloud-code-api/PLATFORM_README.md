@@ -122,9 +122,9 @@ GET /public/mail/<PUBLIC_TOKEN>/latest
 GET /public/mail/<PUBLIC_TOKEN>?format=json
 ```
 
-`/public/mail/<PUBLIC_TOKEN>` 默认返回浏览器查看页；API 客户端应使用响应中的
-`api_url`，或使用上面的 `/latest`、`?format=json` 兼容入口。也可以给查看链接附加
-`Accept: application/json` 请求头。公开 API 不需要登录或邮箱 Key。`code` 只返回
+`viewer_url` 和 `api_url` 现在是同一个统一链接。浏览器导航请求返回查看页；普通 API 请求、
+`fetch` 请求或 `Accept: application/json` 请求返回 JSON。旧的 `canonical_api_url` 和上面的
+`/latest`、`?format=json` 入口仍然兼容。公开 API 不需要登录或邮箱 Key。`code` 只返回
 `PLATFORM_CODE_MAX_AGE_SECONDS`（默认 3600 秒）内的验证码，历史邮件仍在 `messages` 中。
 
 从其他网站的浏览器 JavaScript 跨域调用时，还需要在 `PLATFORM_CORS_ORIGINS` 中列出调用方

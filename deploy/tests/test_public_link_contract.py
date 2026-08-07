@@ -18,10 +18,13 @@ class PublicLinkContractTests(unittest.TestCase):
         self.assertIn('@app.get("/public/mail/{access_token}/latest")', self.app_source)
         self.assertIn('format: str = Query("", max_length=16)', self.app_source)
         self.assertIn('"application/json" in accepted', self.app_source)
+        self.assertIn('sec-fetch-dest', self.app_source)
+        self.assertIn('return True', self.app_source)
+        self.assertIn('"canonical_api_url"', self.app_source)
 
     def test_operator_output_exposes_api_url(self):
-        self.assertIn('data.api_url', self.operator_source)
-        self.assertIn('?format=json', self.operator_source)
+        self.assertIn('统一查看 / API 链接', self.operator_source)
+        self.assertIn('data.canonical_api_url', self.operator_source)
 
     def test_viewer_keeps_prefix_aware_api_fetch(self):
         self.assertIn("const basePath", self.viewer_source)

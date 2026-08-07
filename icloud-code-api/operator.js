@@ -132,9 +132,8 @@ function showOutput(title, text) {
 function publicLinkOutput(data) {
   const parts = [];
   if (data.delivery_line) parts.push(data.delivery_line);
-  parts.push("查看页：", data.viewer_url);
-  parts.push("API 取码（JSON）：", data.api_url);
-  parts.push("同一查看链接的 JSON 兼容地址：", data.viewer_url + "?format=json");
+  parts.push("统一查看 / API 链接：", data.viewer_url);
+  if (data.canonical_api_url) parts.push("规范 API 兼容地址：", data.canonical_api_url);
   return parts.join("\n\n");
 }
 function downloadText(text, filename) {

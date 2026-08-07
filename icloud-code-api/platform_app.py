@@ -1674,19 +1674,32 @@ def public_access_by_token(request: Request, access_token: str) -> dict[str, Any
 
 
 def public_link_payload(token: str) -> dict[str, str]:
+    viewer_url = f"{PUBLIC_ORIGIN}/public/mail/{token}"
     return {
         "token": token,
-        "api_url": f"{PUBLIC_ORIGIN}/api/v1/public/mail/{token}/latest",
-        "viewer_url": f"{PUBLIC_ORIGIN}/public/mail/{token}",
+        "api_url": viewer_url,
+        "viewer_url": viewer_url,
+        "canonical_api_url": f"{PUBLIC_ORIGIN}/api/v1/public/mail/{token}/latest",
     }
 
 
 def public_link_requests_json(request: Request, output_format: str = "") -> bool:
     """Allow API clients to use the public link without breaking browser views."""
-    if str(output_format or "").strip().lower() in {"json", "api"}:
+    normalized_format = str(output_format or "").strip().lower()
+    if normalized_format in {"json", "api"}:
         return True
+    if normalized_format in {"html", "page", "viewer"}:
+        return False
     accepted = request.headers.get("accept", "").lower()
-    return "application/json" in accepted and "text/html" not in accepted
+    if "application/json" in accepted and "text/html" not in accepted:
+        return True
+    if request.headers.get("sec-fetch-dest", "").lower() in {"empty", "fetch", "cors"}:
+        return True
+    if "text/html" in accepted or request.headers.get("sec-fetch-dest", "").lower() in {"document", "iframe"}:
+        return False
+    # Non-browser clients normally omit Accept or send */*; make the one URL
+    # useful as an API without requiring a query string or custom header.
+    return True
 
 
 def delivery_payload(email: str, viewer_url: str) -> dict[str, str]:
@@ -1796,6 +1809,8 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Cache-Control"] = "no-store"
+    if request.url.path.startswith("/public/mail/"):
+        response.headers["Vary"] = "Accept, Sec-Fetch-Dest"
     return response
 
 
