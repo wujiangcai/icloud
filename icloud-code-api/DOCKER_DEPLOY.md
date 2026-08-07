@@ -22,6 +22,7 @@ Copy-Item .env.platform.example .env.platform
 - CADDY_DOMAIN=panel.example.com：公网域名，Caddy 自动申请 HTTPS
 - PLATFORM_PUBLIC_ORIGIN 与实际访问地址一致
 - PLATFORM_MASTER_KEY 必须保持不变；已有数据库时不能重新生成
+- 新部署不能保留示例中的 PLATFORM_MASTER_KEY 占位值；请填入有效 Fernet 密钥，或清空后让程序在 data/platform/platform_master.key 中自动生成
 
 已有数据迁移时，把整个 data/platform 目录复制到项目目录，尤其保留：
 
@@ -70,6 +71,76 @@ http://127.0.0.1/platform/admin
 
 ~~~powershell
 docker compose --env-file .env.platform -f compose.platform.yaml up -d --build
+~~~
+
+## 国内服务器与 Cloudflare Tunnel
+
+国内服务器可以通过 Cloudflare Tunnel 使用自定义域名访问。推荐让
+Cloudflare 在边缘终止 HTTPS，再由服务器上的 cloudflared 转发到本机 Caddy：
+
+~~~text
+用户 -> Cloudflare HTTPS -> cloudflared -> http://127.0.0.1:80 -> Caddy -> API
+~~~
+
+使用 Tunnel 时，环境文件可以设置为：
+
+~~~dotenv
+CADDY_DOMAIN=:80
+PLATFORM_PUBLIC_ORIGIN=https://panel.example.com
+~~~
+
+Tunnel 的公共主机名指向：
+
+~~~text
+http://127.0.0.1:80
+~~~
+
+如果不需要服务器直接接受公网流量，可以把 proxy 端口限制为本机：
+
+~~~yaml
+ports:
+  - "127.0.0.1:80:80"
+  - "127.0.0.1:443:443"
+~~~
+
+Cloudflare Tunnel 不需要开放服务器入站 80/443，也不会替代域名备案或服务商要求；
+国内访问速度和稳定性应使用实际运营商网络测试。使用 Tunnel 时不要把服务器真实 IP
+公开到 DNS。
+
+## 取码链接有效期
+
+公开取码链接本身是长效的，数据库中没有独立的过期时间。链接会在以下情况失效：
+
+- 手动撤销或重新生成公开链接；
+- 对应邮箱或客户被停用；
+- 对应数据被删除或数据库丢失。
+
+PLATFORM_SESSION_TTL_SECONDS 默认 86400 秒，只控制管理员/客户登录会话，不控制公开取码链接。
+PLATFORM_CODE_MAX_AGE_SECONDS 默认 3600 秒，只控制页面允许显示多旧的验证码；链接仍然有效，
+但超过这个时间的旧验证码不会显示。
+
+## 2 核 2 GB 服务器建议
+
+2 核 2 GB 可以运行 API、单个 worker、Caddy 和 Cloudflare Tunnel，适合低并发、少量邮箱
+和简单挂机程序。不要在同一台机器上启动多个 API worker 或多个 platform worker。
+
+资源紧张时可以在 .env.platform 中使用：
+
+~~~dotenv
+PLATFORM_WORKER_INTERVAL_SECONDS=60
+PLATFORM_HME_GENERATION_BATCH_LIMIT=1
+~~~
+
+建议：
+
+- 配置 1–2 GB swap，首次 Docker 构建和依赖安装时更稳；
+- 保留至少 5 GB 可用磁盘空间；
+- 如果其他程序长期占用超过约 1.2 GB 内存，或邮箱数量达到数百、批量生成持续运行，建议升级到 4 GB；
+- 使用 docker stats 观察实时内存和 CPU，使用 Compose 日志排查 worker 是否反复失败。
+
+~~~bash
+docker stats
+docker compose --env-file .env.platform -f compose.platform.yaml logs -f api worker proxy
 ~~~
 
 ## 停止与重启
