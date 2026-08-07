@@ -11,9 +11,17 @@ let statusLabels = {
   inventory: "库存中", sold: "已卖出", self_member: "自用会员",
   self_no_member: "自用未开会员", disabled: "停用", trash: "失效/垃圾"
 };
+const basePath = location.pathname.includes('/platform/') ? location.pathname.split('/platform/')[0] : '';
 
 const safe = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 const fmt = value => value ? new Date(value).toLocaleString("zh-CN", {timeZone:"Asia/Shanghai", hour12:false}) : "未同步";
+const formatBytes = value => {
+  let bytes = Math.max(0, Number(value) || 0); const units = ["B","KB","MB","GB","TB"]; let unit = 0;
+  while (bytes >= 1000 && unit < units.length - 1) { bytes /= 1000; unit++; }
+  const digits = unit === 0 ? 0 : (bytes >= 100 ? 0 : bytes >= 10 ? 1 : 2);
+  return bytes.toFixed(digits) + " " + units[unit];
+};
+const formatCount = value => new Intl.NumberFormat("zh-CN").format(Math.max(0, Number(value) || 0));
 const showToast = (message, error=false) => {
   const node = $("toast"); node.textContent = message; node.className = "toast" + (error ? " error" : "");
   clearTimeout(toastTimer); toastTimer = setTimeout(() => node.className = "toast hidden", 3200);
@@ -27,7 +35,7 @@ const clearSession = () => {
 const api = async (path, options={}) => {
   const headers = {...(options.body !== undefined ? {"Content-Type":"application/json"} : {}), ...(options.headers || {})};
   if (token) headers.Authorization = "Bearer " + token;
-  const response = await fetch(path, {...options, headers, cache:"no-store"});
+  const response = await fetch(basePath + path, {...options, headers, cache:"no-store"});
   const data = await response.json().catch(() => ({}));
   if (!response.ok) { if (response.status === 401) clearSession(); throw Error(data.detail || data.error || "请求失败"); }
   return data;
@@ -135,7 +143,7 @@ function inventoryDeliveryFilters() {
   };
 }
 async function exportDelivery(payload, filename) {
-  const response = await fetch("/api/v1/operator/mailboxes/delivery-export", {
+  const response = await fetch(basePath + "/api/v1/operator/mailboxes/delivery-export", {
     method:"POST", headers:{"Content-Type":"application/json", Authorization:"Bearer "+token},
     body: JSON.stringify(payload), cache:"no-store",
   });
@@ -157,6 +165,55 @@ function setView(view) {
   if (view === "overview") loadOverview(); if (view === "accounts") loadAccounts(); if (view === "inventory") loadInventory(); if (view === "tenants") loadTenants();
 }
 
+function setDashboardLink(id, value) {
+  const link = $(id); link.removeAttribute("href");
+  try { const url = new URL(value); if (url.protocol === "https:" && url.hostname === "dash.cloudflare.com") link.href = url.href; } catch (_) {}
+}
+
+function renderR2Monitor(monitor) {
+  const status = String(monitor?.status || "unavailable");
+  const statusLabels = {ok:"正常", warning:"需要关注", blocked:"已阻止远端写入", unavailable:"监控不可用"};
+  const badge = $("r2StatusBadge"); badge.className = "monitor-badge " + status; badge.textContent = statusLabels[status] || "未知";
+  setDashboardLink("r2DashboardLink", monitor?.dashboard_urls?.r2 || "");
+  setDashboardLink("billingDashboardLink", monitor?.dashboard_urls?.billing || "");
+  if (!monitor?.available) {
+    $("r2Text").textContent = "监控暂不可用"; $("r2Bar").style.width = "0";
+    $("r2MonitorStats").innerHTML = '<div class="monitor-stat"><span>采集状态</span><b>等待恢复</b><small>远端备份将安全地停止写入</small></div>';
+    $("r2MeterText").textContent = "—"; $("r2MeterBar").style.width = "0";
+    $("r2BucketRows").innerHTML = '<div class="empty">尚无远端用量数据</div>';
+    $("r2Trend").innerHTML = '<span class="empty-trend">尚无趋势数据</span>';
+    const issues = monitor?.issues || ["R2 监控数据暂不可用"];
+    $("r2MonitorIssues").className = "monitor-issues blocked"; $("r2MonitorIssues").innerHTML = issues.map(safe).join("<br>");
+    $("r2MonitorMeta").textContent = "监控每 15 分钟自动重试。"; return;
+  }
+  const storage = monitor.storage || {}; const operations = monitor.operations || {};
+  const total = Number(storage.total_bytes || 0); const free = Number(storage.free_limit_bytes || 0);
+  const percent = free ? Math.min(100, total / free * 100) : 0;
+  const budget = (monitor.budget_alerts || []).find(item => item.enabled && item.alert_type === "billing_budget_alert");
+  const budgetValue = budget?.filters?.total_spend_dollars?.[0];
+  const stats = [
+    ["实际存储",formatBytes(total),formatCount(storage.total_objects||0)+" 个对象"],
+    ["免费层剩余",formatBytes(storage.remaining_free_bytes||0),"10 GB-month 免费额度"],
+    ["Class A",formatCount(operations.class_a||0),"免费 "+formatCount(operations.free_class_a||0)+" 次/月"],
+    ["Class B",formatCount(operations.class_b||0),"免费 "+formatCount(operations.free_class_b||0)+" 次/月"],
+    ["计费告警",budgetValue ? "US$"+budgetValue : "未配置",budget ? "Cloudflare 邮件已启用" : "请检查通知策略"],
+  ];
+  $("r2MonitorStats").innerHTML = stats.map(item => `<div class="monitor-stat"><span>${safe(item[0])}</span><b>${safe(item[1])}</b><small>${safe(item[2])}</small></div>`).join("");
+  $("r2Text").textContent = formatBytes(total) + " / " + formatBytes(free);
+  $("r2Bar").style.width = percent + "%"; $("r2Bar").style.background = status === "blocked" ? "#f04438" : status === "warning" ? "#f79009" : "#2e90fa";
+  $("r2MeterText").textContent = `${formatBytes(total)} / ${formatBytes(free)} (${percent.toFixed(3)}%)`;
+  const meter = $("r2MeterBar"); meter.style.width = percent + "%"; meter.className = status === "blocked" ? "blocked" : status === "warning" ? "warning" : "";
+  $("r2BucketRows").innerHTML = (storage.buckets || []).map(bucket => `<div class="monitor-bucket"><strong>${safe(bucket.name)}</strong><span>${safe(formatBytes(bucket.bytes))} · ${safe(formatCount(bucket.objects))} 个对象</span></div>`).join("") || '<div class="empty">Bucket 为空</div>';
+  const history = (monitor.history || []).slice(-96); const trend = $("r2Trend"); trend.textContent = "";
+  if (!history.length) trend.innerHTML = '<span class="empty-trend">尚无趋势数据</span>';
+  history.forEach(point => { const bar=document.createElement("i"); const ratio=storage.hard_limit_bytes ? Number(point.storage_bytes||0)/Number(storage.hard_limit_bytes)*100 : 0; bar.style.height=Math.max(4,Math.min(100,ratio))+"%"; bar.title=fmt(point.at)+" · "+formatBytes(point.storage_bytes); trend.append(bar); });
+  const issues = monitor.issues || []; const issueBox = $("r2MonitorIssues");
+  if (issues.length) { issueBox.className = "monitor-issues" + (status === "blocked" ? " blocked" : ""); issueBox.innerHTML = issues.map(safe).join("<br>"); } else { issueBox.className = "monitor-issues hidden"; issueBox.textContent = ""; }
+  const archive = monitor.project_archive || {}; const archiveText = archive.active ? "项目邮件归档已启用" : "项目邮件归档当前关闭；加密备份仍在同步";
+  const analyticsText = operations.available ? "Cloudflare 操作统计可能有延迟" : "Cloudflare 操作统计暂不可用";
+  $("r2MonitorMeta").innerHTML = `采集时间：<strong>${safe(fmt(monitor.generated_at))}</strong> · ${safe(archiveText)} · ${safe(analyticsText)} · 7 GB 警告 / 8 GB 硬限制`;
+}
+
 async function loadOverview() {
   const data = await api("/api/v1/operator/overview");
   statusLabels = data.mailbox_status_labels || statusLabels;
@@ -165,8 +222,7 @@ async function loadOverview() {
   $("overviewStats").innerHTML = cards.map(item => `<div class="stat"><span>${item[0]}</span><b>${item[1]}</b><small>${item[2]}</small></div>`).join("");
   $("overviewChips").innerHTML = Object.entries(statusLabels).map(([key,label]) => `<span class="chip">${label} <b>${(data.status_counts||{})[key]||0}</b></span>`).join("");
   $("inventoryStatus").innerHTML = statusOptions(); $("bulkStatus").innerHTML = statusOptions("批量改状态");
-  const usage = data.r2_usage || {}; const pct = usage.max_bytes ? Math.min(100, Math.round(usage.put_bytes / usage.max_bytes * 100)) : 0;
-  $("r2Text").textContent = `${Math.round((usage.put_bytes||0)/1024/1024*10)/10} MB / ${Math.round((usage.max_bytes||0)/1024/1024/1024*10)/10} GB`; $("r2Bar").style.width = pct + "%";
+  renderR2Monitor(data.r2_monitor || {});
   const jobs = await loadGenerationJobs(); renderJobs(jobs);
 }
 function renderJobs(jobs) {
@@ -337,6 +393,6 @@ $("selectAll").onchange=event=>{document.querySelectorAll("#inventoryRows input[
 $("bulkApply").onclick=async()=>{const status=$("bulkStatus").value;if(!status||!selected.size){showToast("请选择邮箱和目标状态",true);return;}try{await api("/api/v1/operator/mailboxes/batch-business",{method:"PATCH",body:JSON.stringify({ids:[...selected],status,customer_id:$("bulkCustomer").value||null,order_no:$("bulkOrder").value||null})});showToast(`已批量更新 ${selected.size} 条`);selected.clear();loadInventory();loadOverview();}catch(e){showToast(e.message,true);}};
 $("bulkDeliveryBtn").onclick=async()=>{if(!selected.size){showToast("请先选择要导出的邮箱",true);return;}try{const count=selected.size;const x=await exportDelivery({...inventoryDeliveryFilters(),ids:[...selected]},"icloud-delivery-selected.txt");showToast(`已导出 ${x.count||count} 条发货信息`);}catch(e){showToast(e.message,true);}};
 $("deliveryExportBtn").onclick=async()=>{try{const x=await exportDelivery(inventoryDeliveryFilters(),"icloud-delivery.txt");showToast(`已导出 ${x.count||"筛选结果"} 条发货信息`);}catch(e){showToast(e.message,true);}};
-$("exportBtn").onclick=async()=>{try{const params=new URLSearchParams({search:$("inventorySearch").value.trim(),status:$("inventoryStatus").value,account_id:$("inventoryAccount").value,include_inactive:"true"});const response=await fetch("/api/v1/operator/mailboxes/export?"+params,{headers:{Authorization:"Bearer "+token}});if(!response.ok)throw Error("导出失败");const url=URL.createObjectURL(await response.blob());const link=document.createElement("a");link.href=url;link.download="icloud-mailboxes.csv";link.click();URL.revokeObjectURL(url);}catch(e){showToast(e.message,true);}};
+$("exportBtn").onclick=async()=>{try{const params=new URLSearchParams({search:$("inventorySearch").value.trim(),status:$("inventoryStatus").value,account_id:$("inventoryAccount").value,include_inactive:"true"});const response=await fetch(basePath+"/api/v1/operator/mailboxes/export?"+params,{headers:{Authorization:"Bearer "+token}});if(!response.ok)throw Error("导出失败");const url=URL.createObjectURL(await response.blob());const link=document.createElement("a");link.href=url;link.download="icloud-mailboxes.csv";link.click();URL.revokeObjectURL(url);}catch(e){showToast(e.message,true);}};
 
 if (token) { $("loginView").classList.add("hidden");$("appView").classList.remove("hidden");Promise.all([loadOverview(),loadAccounts()]).then(startGenerationPolling).catch(clearSession); }

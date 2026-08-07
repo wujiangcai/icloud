@@ -1,0 +1,16 @@
+[Unit]
+Description=iCloud Code Platform API and worker
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ubuntu/icloud/icloud-code-api
+ExecStart=/usr/bin/docker compose --env-file /home/ubuntu/icloud/icloud-code-api/.env.platform -f compose.platform.yaml -f /home/ubuntu/icloud/compose.server.yaml up -d api worker
+ExecStop=/usr/bin/docker compose --env-file /home/ubuntu/icloud/icloud-code-api/.env.platform -f compose.platform.yaml -f /home/ubuntu/icloud/compose.server.yaml stop api worker
+RemainAfterExit=yes
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -16,6 +16,8 @@ icloud-code-api/.venv-platform/
 hidemyemail-generator/cookie.txt
 hidemyemail-generator/emails.txt
 hidemyemail-generator/data/
+deploy/backup/backup-r2.env
+deploy/monitor/cloudflare-api.env
 
 # Environment files are local secrets; keep examples trackable
 .env*

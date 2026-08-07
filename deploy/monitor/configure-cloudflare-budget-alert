@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Create an idempotent account-wide Cloudflare usage budget alert."""
+
+from __future__ import annotations
+
+import json
+import os
+import urllib.error
+import urllib.request
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
+
+API_BASE = "https://api.cloudflare.com/client/v4"
+ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+THRESHOLD_RAW = os.environ.get("CLOUDFLARE_BUDGET_ALERT_USD", "0.01").strip()
+RECIPIENT = os.environ.get("CLOUDFLARE_BUDGET_ALERT_EMAIL", "").strip()
+
+
+def request(method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    body = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        API_BASE + path,
+        data=body,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            response = json.load(exc)
+            errors = [item.get("message", "Cloudflare API error") for item in response.get("errors", [])]
+        except Exception:
+            errors = [f"Cloudflare API returned HTTP {exc.code}"]
+        raise RuntimeError("; ".join(errors)) from exc
+
+
+def normalize_threshold(value: str) -> str:
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise ValueError("CLOUDFLARE_BUDGET_ALERT_USD must be a number") from exc
+    if parsed <= 0:
+        raise ValueError("CLOUDFLARE_BUDGET_ALERT_USD must be greater than zero")
+    return format(parsed.normalize(), "f")
+
+
+def main() -> int:
+    if not ACCOUNT_ID or not API_TOKEN:
+        raise RuntimeError("CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are required")
+    threshold = normalize_threshold(THRESHOLD_RAW)
+    recipient = RECIPIENT
+    if not recipient:
+        user = request("GET", "/user")
+        recipient = str((user.get("result") or {}).get("email") or "").strip()
+    if not recipient:
+        raise RuntimeError("set CLOUDFLARE_BUDGET_ALERT_EMAIL because the account email is unavailable")
+
+    path = f"/accounts/{ACCOUNT_ID}/alerting/v3/policies"
+    policies = request("GET", path).get("result") or []
+    for policy in policies:
+        filters = policy.get("filters") or {}
+        mechanisms = policy.get("mechanisms") or {}
+        recipients = {str(item.get("id") or "") for item in mechanisms.get("email") or []}
+        values = {normalize_threshold(str(item)) for item in filters.get("total_spend_dollars") or []}
+        if (
+            policy.get("alert_type") == "billing_budget_alert"
+            and threshold in values
+            and recipient in recipients
+        ):
+            print(json.dumps({"ok": True, "action": "already_exists", "enabled": policy.get("enabled")}, ensure_ascii=False))
+            return 0
+
+    name = os.environ.get(
+        "CLOUDFLARE_BUDGET_ALERT_NAME",
+        f"Cloudflare usage budget alert (US${threshold})",
+    ).strip()
+    payload = {
+        "alert_type": "billing_budget_alert",
+        "enabled": True,
+        "name": name,
+        "description": "Email when account-wide usage-based spend crosses the configured threshold.",
+        "mechanisms": {"email": [{"id": recipient}]},
+        "filters": {"total_spend_dollars": [threshold]},
+    }
+    result = request("POST", path, payload)
+    print(json.dumps({"ok": bool(result.get("success")), "action": "created"}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        raise SystemExit(1)

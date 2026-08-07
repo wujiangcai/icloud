@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""Collect exact R2 usage and Cloudflare analytics without exposing credentials."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import boto3
+from botocore.config import Config
+
+
+ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "").strip()
+API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "").strip()
+APP_ROOT = Path(os.environ.get("ICLOUD_CODE_APP_ROOT", "/home/ubuntu/icloud/icloud-code-api"))
+BUCKETS = tuple(
+    item.strip()
+    for item in os.environ.get(
+        "R2_MONITOR_BUCKETS",
+        "icloud-code-platform-archives,icloud-code-platform-backups",
+    ).split(",")
+    if item.strip()
+)
+OUTPUT_PATH = Path(
+    os.environ.get(
+        "R2_MONITOR_OUTPUT",
+        str(APP_ROOT / "data/platform/r2-monitor.json"),
+    )
+)
+PROJECT_ENV_PATH = Path(
+    os.environ.get("ICLOUD_CODE_PROJECT_ENV", str(APP_ROOT / ".env.platform"))
+)
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+FREE_STORAGE_BYTES = env_int("R2_FREE_STORAGE_BYTES", 10_000_000_000)
+WARNING_STORAGE_BYTES = env_int("R2_WARNING_STORAGE_BYTES", 7_000_000_000)
+HARD_STORAGE_BYTES = env_int("R2_HARD_STORAGE_BYTES", 8_000_000_000)
+FREE_CLASS_A = env_int("R2_FREE_CLASS_A", 1_000_000)
+WARNING_CLASS_A = env_int("R2_WARNING_CLASS_A", 800_000)
+HARD_CLASS_A = env_int("R2_HARD_CLASS_A", 900_000)
+FREE_CLASS_B = env_int("R2_FREE_CLASS_B", 10_000_000)
+WARNING_CLASS_B = env_int("R2_WARNING_CLASS_B", 8_000_000)
+HARD_CLASS_B = env_int("R2_HARD_CLASS_B", 9_000_000)
+
+CLASS_A_ACTIONS = {
+    "ListBuckets",
+    "PutBucket",
+    "ListObjects",
+    "PutObject",
+    "CopyObject",
+    "CompleteMultipartUpload",
+    "CreateMultipartUpload",
+    "ListMultipartUploads",
+    "UploadPart",
+    "UploadPartCopy",
+    "ListParts",
+    "PutBucketEncryption",
+    "PutBucketCors",
+    "PutBucketLifecycleConfiguration",
+}
+CLASS_B_ACTIONS = {
+    "HeadBucket",
+    "HeadObject",
+    "GetObject",
+    "UsageSummary",
+    "GetBucketEncryption",
+    "GetBucketLocation",
+    "GetBucketCors",
+    "GetBucketLifecycleConfiguration",
+}
+
+
+def request_json(url: str, *, data: dict[str, Any] | None = None) -> dict[str, Any]:
+    body = json.dumps(data).encode() if data is not None else None
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.load(exc)
+            messages = [item.get("message", "API error") for item in payload.get("errors", [])]
+        except Exception:
+            messages = [f"HTTP {exc.code}"]
+        raise RuntimeError("; ".join(messages) or f"HTTP {exc.code}") from exc
+
+
+def exact_bucket_usage() -> list[dict[str, Any]]:
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip()
+    if not ACCOUNT_ID or not access_key or not secret_key or not BUCKETS:
+        raise RuntimeError("R2 account, credentials, or bucket list is not configured")
+    client = boto3.client(
+        "s3",
+        endpoint_url=f"https://{ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name="auto",
+        config=Config(signature_version="s3v4", retries={"max_attempts": 3}),
+    )
+    result: list[dict[str, Any]] = []
+    for bucket in BUCKETS:
+        size = 0
+        count = 0
+        newest: datetime | None = None
+        pages = 0
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket):
+            pages += 1
+            for item in page.get("Contents", []):
+                count += 1
+                size += int(item.get("Size", 0))
+                modified = item.get("LastModified")
+                if modified is not None and (newest is None or modified > newest):
+                    newest = modified
+        result.append(
+            {
+                "name": bucket,
+                "objects": count,
+                "bytes": size,
+                "list_pages": pages,
+                "newest_object_at": newest.isoformat() if newest else None,
+            }
+        )
+    return result
+
+
+def cloudflare_analytics(now: datetime) -> dict[str, Any]:
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    query = """
+    query R2Monitor($accountTag: string!, $start: Time!, $end: Time!) {
+      viewer {
+        accounts(filter: {accountTag: $accountTag}) {
+          r2OperationsAdaptiveGroups(
+            limit: 10000
+            filter: {datetime_geq: $start, datetime_leq: $end}
+          ) {
+            sum { requests }
+            dimensions { actionType bucketName }
+          }
+        }
+      }
+    }
+    """
+    payload = request_json(
+        "https://api.cloudflare.com/client/v4/graphql",
+        data={
+            "query": query,
+            "variables": {
+                "accountTag": ACCOUNT_ID,
+                "start": start.isoformat().replace("+00:00", "Z"),
+                "end": now.isoformat().replace("+00:00", "Z"),
+            },
+        },
+    )
+    if payload.get("errors"):
+        messages = [item.get("message", "GraphQL error") for item in payload["errors"]]
+        raise RuntimeError("; ".join(messages))
+    accounts = (((payload.get("data") or {}).get("viewer") or {}).get("accounts") or [])
+    if not accounts:
+        raise RuntimeError("Cloudflare Analytics returned no account data")
+    by_bucket: dict[str, dict[str, int]] = {}
+    class_a = 0
+    class_b = 0
+    other = 0
+    for row in accounts[0].get("r2OperationsAdaptiveGroups") or []:
+        dimensions = row.get("dimensions") or {}
+        bucket = dimensions.get("bucketName") or "(account)"
+        action = dimensions.get("actionType") or "(unknown)"
+        requests = int((row.get("sum") or {}).get("requests") or 0)
+        by_bucket.setdefault(bucket, {})[action] = by_bucket.setdefault(bucket, {}).get(action, 0) + requests
+        if action in CLASS_A_ACTIONS:
+            class_a += requests
+        elif action in CLASS_B_ACTIONS:
+            class_b += requests
+        else:
+            other += requests
+    return {
+        "available": True,
+        "period_start": start.isoformat(),
+        "period_end": now.isoformat(),
+        "class_a": class_a,
+        "class_b": class_b,
+        "free_or_unclassified": other,
+        "by_bucket": by_bucket,
+        "note": "Cloudflare Analytics can lag behind exact S3 object totals.",
+    }
+
+
+def budget_alerts() -> list[dict[str, Any]]:
+    payload = request_json(
+        f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/alerting/v3/policies"
+    )
+    alerts = []
+    for item in payload.get("result") or []:
+        if item.get("alert_type") not in {"billing_budget_alert", "billing_usage_alert"}:
+            continue
+        alerts.append(
+            {
+                "name": item.get("name"),
+                "alert_type": item.get("alert_type"),
+                "enabled": bool(item.get("enabled")),
+                "filters": item.get("filters") or {},
+            }
+        )
+    return alerts
+
+
+def project_archive_status() -> dict[str, Any]:
+    values: dict[str, str] = {}
+    try:
+        for raw in PROJECT_ENV_PATH.read_text(encoding="utf-8").splitlines():
+            if not raw or raw.lstrip().startswith("#") or "=" not in raw:
+                continue
+            key, value = raw.split("=", 1)
+            values[key.strip()] = value.strip()
+    except OSError:
+        pass
+    configured = all(
+        values.get(key)
+        for key in ("R2_ENDPOINT", "R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
+    )
+    enabled = values.get("R2_ARCHIVE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+    return {
+        "configured": configured,
+        "enabled": enabled,
+        "active": configured and enabled,
+        "bucket": values.get("R2_BUCKET") or None,
+        "monthly_max_puts": int(values.get("R2_MONTHLY_MAX_PUTS", "0") or 0),
+        "monthly_max_bytes": int(values.get("R2_MONTHLY_MAX_BYTES", "0") or 0),
+    }
+
+
+def previous_history() -> list[dict[str, Any]]:
+    try:
+        previous = json.loads(OUTPUT_PATH.read_text(encoding="utf-8"))
+        history = previous.get("history") or []
+        return history if isinstance(history, list) else []
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def write_atomic(payload: dict[str, Any]) -> None:
+    parent = OUTPUT_PATH.parent
+    if not parent.is_dir():
+        raise RuntimeError(f"monitor output directory does not exist: {parent}")
+    fd, temporary_name = tempfile.mkstemp(prefix=".r2-monitor-", dir=parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        parent_stat = parent.stat()
+        os.chown(temporary, parent_stat.st_uid, parent_stat.st_gid)
+        os.chmod(temporary, 0o640)
+        os.replace(temporary, OUTPUT_PATH)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def main() -> int:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    try:
+        buckets = exact_bucket_usage()
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": f"exact R2 query failed: {exc}"}, ensure_ascii=False))
+        return 1
+
+    total_bytes = sum(item["bytes"] for item in buckets)
+    total_objects = sum(item["objects"] for item in buckets)
+    issues: list[str] = []
+    try:
+        analytics = cloudflare_analytics(now)
+    except Exception as exc:
+        analytics = {
+            "available": False,
+            "class_a": 0,
+            "class_b": 0,
+            "free_or_unclassified": 0,
+            "by_bucket": {},
+            "error": str(exc),
+        }
+        issues.append("Cloudflare operations analytics is temporarily unavailable")
+    try:
+        alerts = budget_alerts()
+    except Exception as exc:
+        alerts = []
+        issues.append(f"Cloudflare budget alert status unavailable: {exc}")
+
+    class_a = int(analytics.get("class_a") or 0)
+    class_b = int(analytics.get("class_b") or 0)
+    hard_reasons = []
+    warning_reasons = []
+    if total_bytes >= HARD_STORAGE_BYTES:
+        hard_reasons.append("R2 storage hard limit reached")
+    elif total_bytes >= WARNING_STORAGE_BYTES:
+        warning_reasons.append("R2 storage warning threshold reached")
+    if analytics.get("available"):
+        if class_a >= HARD_CLASS_A:
+            hard_reasons.append("R2 Class A hard limit reached")
+        elif class_a >= WARNING_CLASS_A:
+            warning_reasons.append("R2 Class A warning threshold reached")
+        if class_b >= HARD_CLASS_B:
+            hard_reasons.append("R2 Class B hard limit reached")
+        elif class_b >= WARNING_CLASS_B:
+            warning_reasons.append("R2 Class B warning threshold reached")
+    issues.extend(hard_reasons + warning_reasons)
+    status = "blocked" if hard_reasons else ("warning" if issues else "ok")
+
+    history = previous_history()
+    history.append(
+        {
+            "at": now.isoformat(),
+            "storage_bytes": total_bytes,
+            "objects": total_objects,
+            "class_a": class_a,
+            "class_b": class_b,
+        }
+    )
+    cutoff = now - timedelta(days=31)
+    filtered_history = []
+    for item in history[-3500:]:
+        try:
+            stamp = datetime.fromisoformat(str(item.get("at", "")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if stamp >= cutoff:
+            filtered_history.append(item)
+
+    payload = {
+        "available": True,
+        "generated_at": now.isoformat(),
+        "status": status,
+        "issues": issues,
+        "hard_limit_reached": bool(hard_reasons),
+        "storage": {
+            "total_bytes": total_bytes,
+            "total_objects": total_objects,
+            "free_limit_bytes": FREE_STORAGE_BYTES,
+            "warning_bytes": WARNING_STORAGE_BYTES,
+            "hard_limit_bytes": HARD_STORAGE_BYTES,
+            "remaining_free_bytes": max(0, FREE_STORAGE_BYTES - total_bytes),
+            "percent_of_free": round(total_bytes / FREE_STORAGE_BYTES * 100, 4) if FREE_STORAGE_BYTES else 0,
+            "buckets": buckets,
+        },
+        "operations": {
+            **analytics,
+            "free_class_a": FREE_CLASS_A,
+            "warning_class_a": WARNING_CLASS_A,
+            "hard_class_a": HARD_CLASS_A,
+            "free_class_b": FREE_CLASS_B,
+            "warning_class_b": WARNING_CLASS_B,
+            "hard_class_b": HARD_CLASS_B,
+        },
+        "project_archive": project_archive_status(),
+        "budget_alerts": alerts,
+        "dashboard_urls": {
+            "r2": f"https://dash.cloudflare.com/{ACCOUNT_ID}/r2/overview",
+            "billing": f"https://dash.cloudflare.com/{ACCOUNT_ID}/billing",
+            "notifications": f"https://dash.cloudflare.com/{ACCOUNT_ID}/notifications",
+        },
+        "history": filtered_history,
+    }
+    write_atomic(payload)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "status": status,
+                "bytes": total_bytes,
+                "objects": total_objects,
+                "class_a": class_a,
+                "class_b": class_b,
+                "budget_alerts": len(alerts),
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

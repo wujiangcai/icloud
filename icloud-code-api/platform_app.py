@@ -37,6 +37,7 @@ DATA_DIR = Path(os.environ.get("PLATFORM_DATA_DIR", str(APP_DIR / "data" / "plat
 DB_PATH = DATA_DIR / "platform.sqlite3"
 KEY_PATH = DATA_DIR / "platform_master.key"
 OPERATOR_KEY_PATH = DATA_DIR / "platform_admin.key"
+R2_MONITOR_PATH = DATA_DIR / "r2-monitor.json"
 OPERATOR_HTML_PATH = APP_DIR / "operator.html"
 MAX_BODY = 1_048_576
 SERVICE_VERSION = "0.3.2"
@@ -776,6 +777,54 @@ def r2_usage_snapshot() -> dict[str, Any]:
     }
 
 
+def r2_remote_monitor_snapshot() -> dict[str, Any]:
+    """Read the root-generated, secret-free R2 monitor snapshot."""
+    fallback = {
+        "available": False,
+        "status": "unavailable",
+        "stale": True,
+        "issues": ["R2 monitor has not produced a snapshot yet"],
+    }
+    try:
+        if R2_MONITOR_PATH.stat().st_size > 2 * 1024 * 1024:
+            return {**fallback, "issues": ["R2 monitor snapshot is unexpectedly large"]}
+        payload = json.loads(R2_MONITOR_PATH.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not payload.get("available"):
+            return fallback
+        generated = datetime.fromisoformat(str(payload.get("generated_at", "")).replace("Z", "+00:00"))
+        if generated.tzinfo is None:
+            generated = generated.replace(tzinfo=timezone.utc)
+        age_seconds = max(0, int((datetime.now(timezone.utc) - generated).total_seconds()))
+        payload["age_seconds"] = age_seconds
+        payload["stale"] = age_seconds > 30 * 60
+        if payload["stale"]:
+            payload["status"] = "warning"
+            payload["issues"] = list(payload.get("issues") or []) + ["R2 monitor data is stale"]
+        return payload
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return fallback
+
+
+def r2_remote_write_allowed(byte_count: int) -> bool:
+    monitor = r2_remote_monitor_snapshot()
+    if not monitor.get("available") or monitor.get("stale") or monitor.get("hard_limit_reached"):
+        return False
+    try:
+        storage = monitor["storage"]
+        operations = monitor.get("operations") or {}
+        if int(storage["total_bytes"]) + byte_count > int(storage["hard_limit_bytes"]):
+            return False
+        hard_class_a = int(operations.get("hard_class_a") or 0)
+        hard_class_b = int(operations.get("hard_class_b") or 0)
+        if hard_class_a and int(operations.get("class_a") or 0) >= hard_class_a:
+            return False
+        if hard_class_b and int(operations.get("class_b") or 0) >= hard_class_b:
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
 def reserve_r2_upload(byte_count: int) -> bool:
     """Reserve local safety budget before an R2 PUT.
 
@@ -787,6 +836,8 @@ def reserve_r2_upload(byte_count: int) -> bool:
     if not R2_STORAGE.configured or not R2_ARCHIVE_ENABLED:
         return False
     if byte_count < 0 or byte_count > R2_MAX_OBJECT_BYTES:
+        return False
+    if not r2_remote_write_allowed(byte_count):
         return False
     month = datetime.now(timezone.utc).strftime("%Y-%m")
     stamp = now_iso()
@@ -1742,11 +1793,13 @@ async def security_headers(request: Request, call_next):
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    monitor = r2_remote_monitor_snapshot()
     return {
         "ok": True, "service": "icloud-code-platform", "version": SERVICE_VERSION,
         "r2_configured": R2_STORAGE.configured,
         "r2_required": R2_REQUIRED,
         "r2_usage": r2_usage_snapshot(),
+        "r2_monitor_status": monitor.get("status", "unavailable"),
     }
 
 
@@ -1839,6 +1892,7 @@ def operator_overview(_operator: bool = Depends(require_operator)) -> dict[str, 
         "r2_configured": R2_STORAGE.configured,
         "r2_required": R2_REQUIRED,
         "r2_usage": r2_usage_snapshot(),
+        "r2_monitor": r2_remote_monitor_snapshot(),
     }
 
 

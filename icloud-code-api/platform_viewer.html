@@ -170,8 +170,10 @@
   <script>
     (() => {
       const $ = (id) => document.getElementById(id);
+      const publicPath = location.pathname.indexOf('/public/');
+      const basePath = publicPath >= 0 ? location.pathname.slice(0, publicPath) : '';
       const token = decodeURIComponent(location.pathname.split('/').filter(Boolean).pop() || '');
-      const endpoint = '/api/v1/public/mail/' + encodeURIComponent(token) + '/latest';
+      const endpoint = basePath + '/api/v1/public/mail/' + encodeURIComponent(token) + '/latest';
       const root = document.documentElement;
       let currentCode = '';
       let seconds = 15;

@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly maintenance timer for iCloud Code Platform backups
+
+[Timer]
+OnCalendar=Sun *-*-* 04:30:00
+RandomizedDelaySec=15min
+AccuracySec=5min
+Persistent=true
+Unit=icloud-code-platform-backup-maintenance.service
+
+[Install]
+WantedBy=timers.target
