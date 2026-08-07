@@ -118,7 +118,17 @@ Authorization: Bearer <SESSION>
 ```http
 GET /api/v1/public/mail/<PUBLIC_TOKEN>/latest
 GET /public/mail/<PUBLIC_TOKEN>
+GET /public/mail/<PUBLIC_TOKEN>/latest
+GET /public/mail/<PUBLIC_TOKEN>?format=json
 ```
+
+`/public/mail/<PUBLIC_TOKEN>` 默认返回浏览器查看页；API 客户端应使用响应中的
+`api_url`，或使用上面的 `/latest`、`?format=json` 兼容入口。也可以给查看链接附加
+`Accept: application/json` 请求头。公开 API 不需要登录或邮箱 Key。`code` 只返回
+`PLATFORM_CODE_MAX_AGE_SECONDS`（默认 3600 秒）内的验证码，历史邮件仍在 `messages` 中。
+
+从其他网站的浏览器 JavaScript 跨域调用时，还需要在 `PLATFORM_CORS_ORIGINS` 中列出调用方
+来源；服务器端脚本、curl 和同源调用不需要 CORS 配置。
 
 重置公开链接再次调用 `POST`；撤销调用 `DELETE /api/v1/mailboxes/<MAILBOX_ID>/public-access`。公开接口不返回 App 专用密码或邮箱 API Key，且设置 `no-store` 和 `no-referrer`。
 

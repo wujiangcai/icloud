@@ -129,6 +129,14 @@ function showOutput(title, text) {
     const copy = document.querySelector("[data-copy]"); if (copy) copy.onclick = async () => { await navigator.clipboard.writeText(text); showToast("已复制"); };
   }, 0);
 }
+function publicLinkOutput(data) {
+  const parts = [];
+  if (data.delivery_line) parts.push(data.delivery_line);
+  parts.push("查看页：", data.viewer_url);
+  parts.push("API 取码（JSON）：", data.api_url);
+  parts.push("同一查看链接的 JSON 兼容地址：", data.viewer_url + "?format=json");
+  return parts.join("\n\n");
+}
 function downloadText(text, filename) {
   const blob = new Blob(["\ufeff", text], {type:"text/plain;charset=utf-8"});
   const url = URL.createObjectURL(blob); const link = document.createElement("a");
@@ -311,7 +319,7 @@ function makeMailboxRow(mailbox) {
   cell=document.createElement("td");cell.innerHTML=mailbox.latest_code?`<span class="code">${safe(mailbox.latest_code)}</span><small style="display:block;color:#98a2b3">${fmt(mailbox.latest_code_at)}</small>`:'<span class="muted">—</span>';row.append(cell);
   cell=document.createElement("td");cell.textContent=String(mailbox.message_count||0);row.append(cell);
   cell=document.createElement("td");cell.className="mail-cell";cell.innerHTML=`<strong class="${mailbox.last_error?'danger-text':''}">${mailbox.last_error?'异常':fmt(mailbox.last_sync_at)}</strong><small>${safe(mailbox.last_error||"")}</small>`;row.append(cell);
-  cell=document.createElement("td");const actions=document.createElement("div");actions.className="actions";const add=(text,fn)=>{const b=document.createElement("button");b.className="button small";b.textContent=text;b.onclick=fn;actions.append(b);};add("状态",()=>openStatusModal(mailbox));add("历史",()=>showMessages(mailbox));add("发货",async()=>{try{const x=await api(`/api/v1/operator/mailboxes/${mailbox.id}/delivery`);showOutput("单个发货格式",x.delivery_line);loadInventory();}catch(e){showToast(e.message,true);}});add(mailbox.public_access_enabled?"重置链接":"生成链接",async()=>{try{const x=await api(`/api/v1/operator/mailboxes/${mailbox.id}/public-access`,{method:"POST",body:"{}"});showOutput("发货信息",`${x.delivery_line}\n\n查看页：\n${x.viewer_url}\n\n访问令牌：\n${x.token}`);loadInventory();}catch(e){showToast(e.message,true);}});cell.append(actions);row.append(cell);return row;
+  cell=document.createElement("td");const actions=document.createElement("div");actions.className="actions";const add=(text,fn)=>{const b=document.createElement("button");b.className="button small";b.textContent=text;b.onclick=fn;actions.append(b);};add("状态",()=>openStatusModal(mailbox));add("历史",()=>showMessages(mailbox));add("发货",async()=>{try{const x=await api(`/api/v1/operator/mailboxes/${mailbox.id}/delivery`);showOutput("单个发货格式",publicLinkOutput(x));loadInventory();}catch(e){showToast(e.message,true);}});add(mailbox.public_access_enabled?"重置链接":"生成链接",async()=>{try{const x=await api(`/api/v1/operator/mailboxes/${mailbox.id}/public-access`,{method:"POST",body:"{}"});showOutput("发货信息",publicLinkOutput(x));loadInventory();}catch(e){showToast(e.message,true);}});cell.append(actions);row.append(cell);return row;
 }
 function openStatusModal(mailbox) {
   const currentStatus = Object.prototype.hasOwnProperty.call(statusLabels, mailbox.business_status) ? mailbox.business_status : "inventory";

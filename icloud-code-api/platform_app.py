@@ -40,7 +40,7 @@ OPERATOR_KEY_PATH = DATA_DIR / "platform_admin.key"
 R2_MONITOR_PATH = DATA_DIR / "r2-monitor.json"
 OPERATOR_HTML_PATH = APP_DIR / "operator.html"
 MAX_BODY = 1_048_576
-SERVICE_VERSION = "0.3.2"
+SERVICE_VERSION = "0.3.3"
 INVENTORY_TENANT_ID = "__platform_inventory__"
 INVENTORY_TENANT_EMAIL = "platform-inventory@platform.invalid"
 INVENTORY_TENANT_DISPLAY = "\u5e73\u53f0\u5e93\u5b58\uff08\u672a\u5206\u914d\u5ba2\u6237\uff09"
@@ -1681,6 +1681,14 @@ def public_link_payload(token: str) -> dict[str, str]:
     }
 
 
+def public_link_requests_json(request: Request, output_format: str = "") -> bool:
+    """Allow API clients to use the public link without breaking browser views."""
+    if str(output_format or "").strip().lower() in {"json", "api"}:
+        return True
+    accepted = request.headers.get("accept", "").lower()
+    return "application/json" in accepted and "text/html" not in accepted
+
+
 def delivery_payload(email: str, viewer_url: str) -> dict[str, str]:
     return {
         "mailbox_email": email,
@@ -2714,6 +2722,12 @@ def public_customer_code(request: Request, access_token: str) -> dict[str, Any]:
     }
 
 
+@app.get("/public/mail/{access_token}/latest")
+def public_mail_latest_compat(request: Request, access_token: str) -> dict[str, Any]:
+    """Compatibility alias for clients that start with the browser link."""
+    return public_customer_code(request, access_token)
+
+
 @app.get("/api/v1/public/mail/{access_token}/messages")
 def public_customer_messages(
     request: Request,
@@ -2730,11 +2744,17 @@ def public_customer_messages(
     }
 
 
-@app.get("/public/mail/{access_token}", response_class=HTMLResponse)
-def public_mail_viewer(access_token: str) -> str:
+@app.get("/public/mail/{access_token}", response_model=None)
+def public_mail_viewer(
+    access_token: str,
+    request: Request,
+    format: str = Query("", max_length=16),
+) -> Any:
     if not access_token or len(access_token) > 256:
         raise HTTPException(404, "public link not found")
-    return PUBLIC_VIEWER_HTML
+    if public_link_requests_json(request, format):
+        return public_customer_code(request, access_token)
+    return HTMLResponse(PUBLIC_VIEWER_HTML)
 
 
 @app.get("/platform/admin", response_class=HTMLResponse)
