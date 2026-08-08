@@ -1,0 +1,22 @@
+[Unit]
+Description=Retention and integrity check for iCloud Code Platform backups
+Documentation=https://github.com/wujiangcai/icloud/blob/main/deploy/backup/RESTORE.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+EnvironmentFile=/etc/icloud-code-platform/backup-r2.env
+ExecStart=/usr/bin/flock --nonblock /run/lock/icloud-code-platform-backup.lock /usr/local/sbin/icloud-code-platform-backup maintenance
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=2h
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/backups/icloud-code-platform /var/lib/icloud-code-platform-backup /var/cache/icloud-code-platform-restic /run/lock

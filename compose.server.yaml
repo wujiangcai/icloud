@@ -1,0 +1,20 @@
+services:
+  api:
+    build:
+      args:
+        PIP_INDEX_URL: "${PIP_INDEX_URL:-https://pypi.org/simple}"
+    ports:
+      - "127.0.0.1:8766:8766"
+    mem_limit: 256m
+    cpus: "0.50"
+    pids_limit: 128
+    stop_grace_period: 30s
+
+  worker:
+    build:
+      args:
+        PIP_INDEX_URL: "${PIP_INDEX_URL:-https://pypi.org/simple}"
+    mem_limit: 384m
+    cpus: "0.75"
+    pids_limit: 128
+    stop_grace_period: 30s

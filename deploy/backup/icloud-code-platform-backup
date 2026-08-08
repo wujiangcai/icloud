@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Consistent local and R2 backups for iCloud Code Platform."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+APP_ROOT = Path(os.environ.get("ICLOUD_CODE_APP_ROOT", "/home/ubuntu/icloud/icloud-code-api"))
+DATA_DIR = Path(os.environ.get("ICLOUD_CODE_DATA_DIR", str(APP_ROOT / "data/platform")))
+DB_PATH = DATA_DIR / "platform.sqlite3"
+STATE_DIR = Path(os.environ.get("ICLOUD_CODE_BACKUP_STATE_DIR", "/var/lib/icloud-code-platform-backup"))
+CURRENT_SNAPSHOT = STATE_DIR / "current"
+BACKUP_TAG = "icloud-code-platform"
+HOSTNAME = socket.gethostname()
+R2_MONITOR_COMMAND = Path(os.environ.get("R2_MONITOR_COMMAND", "/usr/local/sbin/icloud-code-r2-monitor"))
+R2_MONITOR_PATH = Path(os.environ.get("R2_MONITOR_OUTPUT", str(DATA_DIR / "r2-monitor.json")))
+
+
+def log(message: str) -> None:
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    print(f"[{stamp}] {message}", flush=True)
+
+
+def run(command: list[str]) -> None:
+    log("running: " + " ".join(command))
+    subprocess.run(command, check=True)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def copy_required(source: Path, destination: Path) -> None:
+    if not source.is_file():
+        raise FileNotFoundError(f"required backup source is missing: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    destination.chmod(0o600)
+
+
+def sqlite_online_backup(destination: Path) -> dict[str, int | str]:
+    source_uri = f"file:{DB_PATH}?mode=ro"
+    source = sqlite3.connect(source_uri, uri=True, timeout=30)
+    target = sqlite3.connect(destination)
+    try:
+        source.backup(target, pages=256, sleep=0.05)
+        target.commit()
+        integrity = str(target.execute("PRAGMA integrity_check").fetchone()[0])
+        if integrity.lower() != "ok":
+            raise RuntimeError(f"SQLite snapshot integrity check failed: {integrity}")
+
+        def count(table: str) -> int:
+            exists = target.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            return int(target.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]) if exists else 0
+
+        return {
+            "integrity_check": integrity,
+            "tenants": count("tenants"),
+            "mailboxes": count("mailboxes"),
+            "messages": count("messages"),
+        }
+    finally:
+        target.close()
+        source.close()
+
+
+def build_snapshot() -> Path:
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    work = Path(tempfile.mkdtemp(prefix=".snapshot-", dir=STATE_DIR))
+    try:
+        data_target = work / "data"
+        config_target = work / "config"
+        data_target.mkdir(mode=0o700)
+        config_target.mkdir(mode=0o700)
+
+        db_stats = sqlite_online_backup(data_target / "platform.sqlite3")
+        (data_target / "platform.sqlite3").chmod(0o600)
+        copy_required(DATA_DIR / "platform_master.key", data_target / "platform_master.key")
+        copy_required(DATA_DIR / "platform_admin.key", data_target / "platform_admin.key")
+        copy_required(APP_ROOT / ".env.platform", config_target / ".env.platform")
+        copy_required(APP_ROOT / "compose.platform.yaml", config_target / "compose.platform.yaml")
+        if (APP_ROOT / "Caddyfile").is_file():
+            copy_required(APP_ROOT / "Caddyfile", config_target / "Caddyfile")
+
+        files: dict[str, dict[str, int | str]] = {}
+        for item in sorted(work.rglob("*")):
+            if item.is_file():
+                files[str(item.relative_to(work))] = {
+                    "bytes": item.stat().st_size,
+                    "sha256": sha256_file(item),
+                }
+
+        manifest = {
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "hostname": HOSTNAME,
+            "source": str(DATA_DIR),
+            "sqlite": db_stats,
+            "files": files,
+        }
+        manifest_path = work / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        manifest_path.chmod(0o600)
+
+        if CURRENT_SNAPSHOT.exists():
+            if CURRENT_SNAPSHOT.parent.resolve() != STATE_DIR.resolve():
+                raise RuntimeError("refusing to replace an unexpected snapshot path")
+            shutil.rmtree(CURRENT_SNAPSHOT)
+        os.replace(work, CURRENT_SNAPSHOT)
+        log(
+            "consistent snapshot ready: "
+            f"tenants={db_stats['tenants']} mailboxes={db_stats['mailboxes']} messages={db_stats['messages']}"
+        )
+        return CURRENT_SNAPSHOT
+    except Exception:
+        if work.exists():
+            shutil.rmtree(work)
+        raise
+
+
+def repositories() -> list[tuple[str, str]]:
+    local = os.environ.get("LOCAL_REPOSITORY", "").strip()
+    remote = os.environ.get("R2_REPOSITORY", "").strip()
+    if not local:
+        raise RuntimeError("LOCAL_REPOSITORY is not configured")
+    result = [("local", local)]
+    if remote:
+        result.append(("r2", remote))
+    return result
+
+
+def retention_args(name: str) -> list[str]:
+    hourly = "48" if name == "local" else "24"
+    return [
+        "--keep-hourly", hourly,
+        "--keep-daily", "30",
+        "--keep-weekly", "12",
+        "--keep-monthly", "12",
+    ]
+
+
+def remote_backup_allowed(snapshot: Path) -> bool:
+    """Fail closed before an R2 write while always allowing the local backup."""
+    if not R2_MONITOR_COMMAND.is_file():
+        log("R2 backup blocked: usage monitor is not installed")
+        return False
+    completed = subprocess.run(
+        [str(R2_MONITOR_COMMAND)],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stdout or completed.stderr or "monitor failed").strip()
+        log(f"R2 backup blocked: unable to refresh usage monitor: {detail}")
+        return False
+    try:
+        monitor = json.loads(R2_MONITOR_PATH.read_text(encoding="utf-8"))
+        storage = monitor["storage"]
+        operations = monitor.get("operations") or {}
+        total_bytes = int(storage["total_bytes"])
+        hard_bytes = int(storage["hard_limit_bytes"])
+        class_a = int(operations.get("class_a") or 0)
+        hard_class_a = int(operations.get("hard_class_a") or 0)
+        class_b = int(operations.get("class_b") or 0)
+        hard_class_b = int(operations.get("hard_class_b") or 0)
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        log(f"R2 backup blocked: invalid usage monitor data: {exc}")
+        return False
+    snapshot_bytes = sum(item.stat().st_size for item in snapshot.rglob("*") if item.is_file())
+    reasons = []
+    if bool(monitor.get("hard_limit_reached")) or total_bytes + snapshot_bytes > hard_bytes:
+        reasons.append(
+            f"projected storage {total_bytes + snapshot_bytes} exceeds hard limit {hard_bytes}"
+        )
+    if hard_class_a and class_a >= hard_class_a:
+        reasons.append(f"Class A operations {class_a} reached hard limit {hard_class_a}")
+    if hard_class_b and class_b >= hard_class_b:
+        reasons.append(f"Class B operations {class_b} reached hard limit {hard_class_b}")
+    if reasons:
+        log("R2 backup blocked by free-tier guard: " + "; ".join(reasons))
+        return False
+    log(
+        "R2 free-tier guard passed: "
+        f"storage={total_bytes}/{hard_bytes} projected_addition<={snapshot_bytes} "
+        f"class_a={class_a}/{hard_class_a} class_b={class_b}/{hard_class_b}"
+    )
+    return True
+
+
+def backup() -> None:
+    if not os.environ.get("RESTIC_PASSWORD_FILE", "").strip():
+        raise RuntimeError("RESTIC_PASSWORD_FILE is not configured")
+    snapshot = build_snapshot()
+    remote_blocked = False
+    for name, repository in repositories():
+        if name == "r2" and not remote_backup_allowed(snapshot):
+            remote_blocked = True
+            continue
+        log(f"starting encrypted {name} backup")
+        run([
+            "restic", "-r", repository, "backup", str(snapshot),
+            "--tag", BACKUP_TAG, "--host", HOSTNAME,
+        ])
+        run([
+            "restic", "-r", repository, "forget",
+            "--tag", BACKUP_TAG, "--host", HOSTNAME,
+            *retention_args(name),
+        ])
+        log(f"{name} backup completed")
+    if remote_blocked:
+        raise RuntimeError("local backup completed, but R2 backup was blocked by the free-tier guard")
+
+
+def maintenance() -> None:
+    for name, repository in repositories():
+        log(f"starting {name} repository maintenance")
+        run([
+            "restic", "-r", repository, "forget", "--prune",
+            "--tag", BACKUP_TAG, "--host", HOSTNAME,
+            *retention_args(name),
+        ])
+        run(["restic", "-r", repository, "check", "--read-data"])
+        run(["restic", "-r", repository, "cache", "--cleanup"])
+        log(f"{name} repository maintenance completed")
+
+
+def main() -> int:
+    mode = sys.argv[1] if len(sys.argv) > 1 else "backup"
+    try:
+        if mode == "backup":
+            backup()
+        elif mode == "maintenance":
+            maintenance()
+        else:
+            raise ValueError("usage: icloud-code-platform-backup [backup|maintenance]")
+    except Exception as exc:
+        log(f"FAILED: {type(exc).__name__}: {exc}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

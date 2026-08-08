@@ -6,12 +6,13 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
 COPY requirements-platform.txt ./
+ARG PIP_INDEX_URL=https://pypi.org/simple
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gosu \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir -r requirements-platform.txt
+    && pip install --no-cache-dir --default-timeout=180 --retries=5 --index-url "${PIP_INDEX_URL}" -r requirements-platform.txt
 
-COPY app.py platform_app.py platform_worker.py operator.html operator.css operator.js ./
+COPY app.py platform_app.py platform_worker.py platform_admin.html platform_viewer.html operator.html operator.css operator.js ./
 COPY python ./python
 COPY vendor ./vendor
 RUN mkdir -p /app/data/platform \

@@ -37,9 +37,10 @@ DATA_DIR = Path(os.environ.get("PLATFORM_DATA_DIR", str(APP_DIR / "data" / "plat
 DB_PATH = DATA_DIR / "platform.sqlite3"
 KEY_PATH = DATA_DIR / "platform_master.key"
 OPERATOR_KEY_PATH = DATA_DIR / "platform_admin.key"
+R2_MONITOR_PATH = DATA_DIR / "r2-monitor.json"
 OPERATOR_HTML_PATH = APP_DIR / "operator.html"
 MAX_BODY = 1_048_576
-SERVICE_VERSION = "0.3.2"
+SERVICE_VERSION = "0.3.4"
 INVENTORY_TENANT_ID = "__platform_inventory__"
 INVENTORY_TENANT_EMAIL = "platform-inventory@platform.invalid"
 INVENTORY_TENANT_DISPLAY = "\u5e73\u53f0\u5e93\u5b58\uff08\u672a\u5206\u914d\u5ba2\u6237\uff09"
@@ -88,6 +89,7 @@ def load_operator_html() -> str:
 
 SESSION_TTL = env_int("PLATFORM_SESSION_TTL_SECONDS", 86400, 900, 30 * 86400)
 CODE_MAX_AGE = env_int("PLATFORM_CODE_MAX_AGE_SECONDS", 3600, 0, 30 * 86400)
+CODE_REQUEST_SYNC_COOLDOWN = env_int("PLATFORM_REQUEST_SYNC_COOLDOWN_SECONDS", 8, 0, 300)
 LOOKBACK_DAYS = env_int("PLATFORM_IMAP_LOOKBACK_DAYS", 3, 1, 365)
 RECENT_LIMIT = env_int("PLATFORM_IMAP_RECENT_LIMIT", 200, 1, 500)
 PUBLIC_ORIGIN = os.environ.get("PLATFORM_PUBLIC_ORIGIN", "http://127.0.0.1:8766").strip().rstrip("/")
@@ -737,6 +739,15 @@ def tenant_mailbox(tenant_id: str, mailbox_id: str) -> dict[str, Any]:
     return dict(row)
 
 
+def active_mailbox(mailbox_id: str) -> dict[str, Any]:
+    """Load the full mailbox record for a public, on-demand sync."""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM mailboxes WHERE id=? AND active=1", (mailbox_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "mailbox not found")
+    return dict(row)
+
+
 def public_mailbox(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": row["id"], "email": row["email"], "label": row["label"],
@@ -762,6 +773,32 @@ def parse_date(value: str) -> datetime:
         return datetime.now(timezone.utc).replace(microsecond=0)
 
 
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def parse_imap_internal_date(fetch_data: list[Any]) -> datetime | None:
+    """Use the server arrival time when selecting the newest message."""
+    for item in fetch_data:
+        if not isinstance(item, tuple) or not item:
+            continue
+        try:
+            parsed = imaplib.Internaldate2tuple(item[0])
+            if parsed:
+                return datetime.fromtimestamp(time.mktime(parsed), timezone.utc).replace(microsecond=0)
+        except (OverflowError, OSError, TypeError, ValueError):
+            continue
+    return None
+
+
 def r2_usage_snapshot() -> dict[str, Any]:
     month = datetime.now(timezone.utc).strftime("%Y-%m")
     with db() as conn:
@@ -776,6 +813,54 @@ def r2_usage_snapshot() -> dict[str, Any]:
     }
 
 
+def r2_remote_monitor_snapshot() -> dict[str, Any]:
+    """Read the root-generated, secret-free R2 monitor snapshot."""
+    fallback = {
+        "available": False,
+        "status": "unavailable",
+        "stale": True,
+        "issues": ["R2 monitor has not produced a snapshot yet"],
+    }
+    try:
+        if R2_MONITOR_PATH.stat().st_size > 2 * 1024 * 1024:
+            return {**fallback, "issues": ["R2 monitor snapshot is unexpectedly large"]}
+        payload = json.loads(R2_MONITOR_PATH.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not payload.get("available"):
+            return fallback
+        generated = datetime.fromisoformat(str(payload.get("generated_at", "")).replace("Z", "+00:00"))
+        if generated.tzinfo is None:
+            generated = generated.replace(tzinfo=timezone.utc)
+        age_seconds = max(0, int((datetime.now(timezone.utc) - generated).total_seconds()))
+        payload["age_seconds"] = age_seconds
+        payload["stale"] = age_seconds > 30 * 60
+        if payload["stale"]:
+            payload["status"] = "warning"
+            payload["issues"] = list(payload.get("issues") or []) + ["R2 monitor data is stale"]
+        return payload
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return fallback
+
+
+def r2_remote_write_allowed(byte_count: int) -> bool:
+    monitor = r2_remote_monitor_snapshot()
+    if not monitor.get("available") or monitor.get("stale") or monitor.get("hard_limit_reached"):
+        return False
+    try:
+        storage = monitor["storage"]
+        operations = monitor.get("operations") or {}
+        if int(storage["total_bytes"]) + byte_count > int(storage["hard_limit_bytes"]):
+            return False
+        hard_class_a = int(operations.get("hard_class_a") or 0)
+        hard_class_b = int(operations.get("hard_class_b") or 0)
+        if hard_class_a and int(operations.get("class_a") or 0) >= hard_class_a:
+            return False
+        if hard_class_b and int(operations.get("class_b") or 0) >= hard_class_b:
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
 def reserve_r2_upload(byte_count: int) -> bool:
     """Reserve local safety budget before an R2 PUT.
 
@@ -787,6 +872,8 @@ def reserve_r2_upload(byte_count: int) -> bool:
     if not R2_STORAGE.configured or not R2_ARCHIVE_ENABLED:
         return False
     if byte_count < 0 or byte_count > R2_MAX_OBJECT_BYTES:
+        return False
+    if not r2_remote_write_allowed(byte_count):
         return False
     month = datetime.now(timezone.utc).strftime("%Y-%m")
     stamp = now_iso()
@@ -964,7 +1051,13 @@ def mark_account_address_sync(account_id: str, returned_emails: set[str], maildo
         )
 
 
-def _store_parsed_message(row: dict[str, Any], uid: str, raw_email: bytes, message: Any) -> tuple[bool, int, int]:
+def _store_parsed_message(
+    row: dict[str, Any],
+    uid: str,
+    raw_email: bytes,
+    message: Any,
+    internal_date: datetime | None = None,
+) -> tuple[bool, int, int]:
     subject = clean_text(str(message.get("Subject") or ""))[:500]
     sender = clean_text(str(message.get("From") or ""))[:500]
     recipients = clean_text(
@@ -972,7 +1065,7 @@ def _store_parsed_message(row: dict[str, Any], uid: str, raw_email: bytes, messa
     )[:1000]
     body = message_body_text(message)
     code = extract_code("\n".join((subject, sender, recipients, body)))
-    received = parse_date(str(message.get("Date") or ""))
+    received = internal_date or parse_date(str(message.get("Date") or ""))
     message_id = clean_text(str(message.get("Message-ID") or ""))[:500]
     with db() as conn:
         before = conn.execute(
@@ -1076,6 +1169,7 @@ def sync_icloud_account(account_id: str) -> dict[str, Any]:
             status_code, fetched = client.uid("fetch", uid, "(BODY.PEEK[] INTERNALDATE)")
             if status_code != "OK":
                 continue
+            internal_date = parse_imap_internal_date(fetched)
             raw_email = next((item[1] for item in fetched if isinstance(item, tuple) and len(item) > 1 and isinstance(item[1], bytes)), None)
             if not raw_email:
                 continue
@@ -1088,7 +1182,7 @@ def sync_icloud_account(account_id: str) -> dict[str, Any]:
                 continue
             inspected += 1
             for mailbox in matched:
-                new_row, archived_row, r2_row = _store_parsed_message(mailbox, uid, raw_email, message)
+                new_row, archived_row, r2_row = _store_parsed_message(mailbox, uid, raw_email, message, internal_date)
                 inserted += int(new_row)
                 archived += archived_row
                 r2_errors += r2_row
@@ -1160,6 +1254,7 @@ def sync_mailbox(row: dict[str, Any]) -> dict[str, Any]:
             status_code, fetched = client.uid("fetch", uid, "(BODY.PEEK[] INTERNALDATE)")
             if status_code != "OK":
                 continue
+            internal_date = parse_imap_internal_date(fetched)
             raw_email = next((item[1] for item in fetched if isinstance(item, tuple) and len(item) > 1 and isinstance(item[1], bytes)), None)
             if not raw_email:
                 continue
@@ -1172,7 +1267,7 @@ def sync_mailbox(row: dict[str, Any]) -> dict[str, Any]:
             inspected += 1
             body = message_body_text(message)
             code = extract_code("\n".join((subject, sender, recipients, body)))
-            received = parse_date(str(message.get("Date") or ""))
+            received = internal_date or parse_date(str(message.get("Date") or ""))
             message_id = clean_text(str(message.get("Message-ID") or ""))[:500]
             with db() as conn:
                 before = conn.execute("SELECT id,r2_object_key FROM messages WHERE mailbox_id=? AND imap_uid=?", (row["id"], uid)).fetchone()
@@ -1231,6 +1326,31 @@ def sync_mailbox(row: dict[str, Any]) -> dict[str, Any]:
             except Exception:
                 pass
         lock.release()
+
+
+def sync_before_code_read(row: dict[str, Any]) -> dict[str, Any]:
+    """Refresh a mailbox before reading its code, while protecting IMAP."""
+    last_sync_text = row.get("last_sync_at")
+    if row.get("account_id"):
+        with db() as conn:
+            account = conn.execute("SELECT last_imap_sync_at FROM icloud_accounts WHERE id=?", (row["account_id"],)).fetchone()
+        last_sync_text = account["last_imap_sync_at"] if account is not None else None
+    last_sync = parse_iso_datetime(last_sync_text)
+    if (
+        CODE_REQUEST_SYNC_COOLDOWN > 0
+        and last_sync is not None
+        and datetime.now(timezone.utc) - last_sync < timedelta(seconds=CODE_REQUEST_SYNC_COOLDOWN)
+    ):
+        return {"ok": True, "skipped": True, "reason": "cooldown", "synced_at": last_sync_text}
+    try:
+        return sync_mailbox(row)
+    except RuntimeError as exc:
+        raise HTTPException(502, "mailbox sync failed; please retry") from exc
+
+
+def fresh_latest_code(row: dict[str, Any], after: int = 0) -> tuple[dict[str, Any], dict[str, Any]]:
+    sync_result = sync_before_code_read(row)
+    return get_latest_code(row, after), sync_result
 
 
 def sync_icloud_account_addresses(account_id: str) -> dict[str, Any]:
@@ -1560,7 +1680,7 @@ def message_history(mailbox_id: str, limit: int = 50, before_id: int = 0) -> dic
             SELECT id,subject,from_addr,to_addrs,body_preview,code,received_at
             FROM messages
             WHERE mailbox_id=? AND (?=0 OR id<?)
-            ORDER BY id DESC
+            ORDER BY datetime(received_at) DESC,id DESC
             LIMIT ?
             """,
             (mailbox_id, cursor, cursor, page_size + 1),
@@ -1623,11 +1743,32 @@ def public_access_by_token(request: Request, access_token: str) -> dict[str, Any
 
 
 def public_link_payload(token: str) -> dict[str, str]:
+    viewer_url = f"{PUBLIC_ORIGIN}/public/mail/{token}"
     return {
         "token": token,
-        "api_url": f"{PUBLIC_ORIGIN}/api/v1/public/mail/{token}/latest",
-        "viewer_url": f"{PUBLIC_ORIGIN}/public/mail/{token}",
+        "api_url": viewer_url,
+        "viewer_url": viewer_url,
+        "canonical_api_url": f"{PUBLIC_ORIGIN}/api/v1/public/mail/{token}/latest",
     }
+
+
+def public_link_requests_json(request: Request, output_format: str = "") -> bool:
+    """Allow API clients to use the public link without breaking browser views."""
+    normalized_format = str(output_format or "").strip().lower()
+    if normalized_format in {"json", "api"}:
+        return True
+    if normalized_format in {"html", "page", "viewer"}:
+        return False
+    accepted = request.headers.get("accept", "").lower()
+    if "application/json" in accepted and "text/html" not in accepted:
+        return True
+    if request.headers.get("sec-fetch-dest", "").lower() in {"empty", "fetch", "cors"}:
+        return True
+    if "text/html" in accepted or request.headers.get("sec-fetch-dest", "").lower() in {"document", "iframe"}:
+        return False
+    # Non-browser clients normally omit Accept or send */*; make the one URL
+    # useful as an API without requiring a query string or custom header.
+    return True
 
 
 def delivery_payload(email: str, viewer_url: str) -> dict[str, str]:
@@ -1737,16 +1878,20 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Cache-Control"] = "no-store"
+    if request.url.path.startswith("/public/mail/"):
+        response.headers["Vary"] = "Accept, Sec-Fetch-Dest"
     return response
 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    monitor = r2_remote_monitor_snapshot()
     return {
         "ok": True, "service": "icloud-code-platform", "version": SERVICE_VERSION,
         "r2_configured": R2_STORAGE.configured,
         "r2_required": R2_REQUIRED,
         "r2_usage": r2_usage_snapshot(),
+        "r2_monitor_status": monitor.get("status", "unavailable"),
     }
 
 
@@ -1839,6 +1984,7 @@ def operator_overview(_operator: bool = Depends(require_operator)) -> dict[str, 
         "r2_configured": R2_STORAGE.configured,
         "r2_required": R2_REQUIRED,
         "r2_usage": r2_usage_snapshot(),
+        "r2_monitor": r2_remote_monitor_snapshot(),
     }
 
 
@@ -2496,7 +2642,7 @@ def operator_sync_mailbox(mailbox_id: str, request: Request, _operator: bool = D
 def operator_mailbox_code(mailbox_id: str, request: Request, after: int = Query(0, ge=0), _operator: bool = Depends(require_operator)) -> dict[str, Any]:
     row = operator_mailbox_row(mailbox_id, active_only=False)
     rate_limit(request, "operator-code", 120)
-    result = get_latest_code(row, after)
+    result, _sync = fresh_latest_code(row, after)
     return {"ok": True, "mailbox": row["email"], **result}
 
 
@@ -2624,7 +2770,8 @@ def manual_sync(mailbox_id: str, request: Request, tenant: dict[str, Any] = Depe
 def management_code(mailbox_id: str, request: Request, after: int = Query(0, ge=0), tenant: dict[str, Any] = Depends(require_session)) -> dict[str, Any]:
     row = tenant_mailbox(tenant["id"], mailbox_id)
     rate_limit(request, "management-code", 60)
-    return get_latest_code(row, after)
+    result, _sync = fresh_latest_code(row, after)
+    return result
 
 
 @app.get("/api/v1/mailboxes/{mailbox_id}/messages")
@@ -2640,15 +2787,15 @@ def management_messages(
 
 @app.get("/api/v1/code")
 def customer_code(request: Request, mailbox_id: str = Query(..., min_length=8, max_length=64), after: int = Query(0, ge=0)) -> dict[str, Any]:
-    return get_latest_code(mailbox_by_key(request, mailbox_id), after)
+    result, _sync = fresh_latest_code(mailbox_by_key(request, mailbox_id), after)
+    return result
 
 
 @app.get("/api/v1/public/mail/{access_token}/latest")
 def public_customer_code(request: Request, access_token: str) -> dict[str, Any]:
     access = public_access_by_token(request, access_token)
-    mailbox = dict(access)
-    mailbox["id"] = access["mailbox_id"]
-    result = get_latest_code(mailbox, 0)
+    mailbox = active_mailbox(access["mailbox_id"])
+    result, sync_result = fresh_latest_code(mailbox, 0)
     history = message_history(access["mailbox_id"])
     return {
         "ok": True,
@@ -2656,8 +2803,17 @@ def public_customer_code(request: Request, access_token: str) -> dict[str, Any]:
         "label": access["label"],
         "mail": result["mail"],
         "code": result["code"],
+        "code_received_at": result["mail"]["received_at"] if result["mail"] else None,
+        "synced_at": sync_result.get("synced_at"),
+        "sync_skipped": bool(sync_result.get("skipped")),
         **history,
     }
+
+
+@app.get("/public/mail/{access_token}/latest")
+def public_mail_latest_compat(request: Request, access_token: str) -> dict[str, Any]:
+    """Compatibility alias for clients that start with the browser link."""
+    return public_customer_code(request, access_token)
 
 
 @app.get("/api/v1/public/mail/{access_token}/messages")
@@ -2668,6 +2824,7 @@ def public_customer_messages(
     before: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     access = public_access_by_token(request, access_token)
+    sync_before_code_read(active_mailbox(access["mailbox_id"]))
     return {
         "ok": True,
         "email": access["email"],
@@ -2676,11 +2833,17 @@ def public_customer_messages(
     }
 
 
-@app.get("/public/mail/{access_token}", response_class=HTMLResponse)
-def public_mail_viewer(access_token: str) -> str:
+@app.get("/public/mail/{access_token}", response_model=None)
+def public_mail_viewer(
+    access_token: str,
+    request: Request,
+    format: str = Query("", max_length=16),
+) -> Any:
     if not access_token or len(access_token) > 256:
         raise HTTPException(404, "public link not found")
-    return PUBLIC_VIEWER_HTML
+    if public_link_requests_json(request, format):
+        return public_customer_code(request, access_token)
+    return HTMLResponse(PUBLIC_VIEWER_HTML)
 
 
 @app.get("/platform/admin", response_class=HTMLResponse)

@@ -1,0 +1,25 @@
+[Unit]
+Description=Encrypted backup for iCloud Code Platform
+Documentation=https://github.com/wujiangcai/icloud/blob/main/deploy/backup/RESTORE.md
+Wants=network-online.target
+After=network-online.target docker.service
+ConditionPathExists=/home/ubuntu/icloud/icloud-code-api/data/platform/platform.sqlite3
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+EnvironmentFile=/etc/icloud-code-platform/backup-r2.env
+EnvironmentFile=/etc/icloud-code-platform/cloudflare-api.env
+EnvironmentFile=/etc/icloud-code-platform/r2-monitor.env
+ExecStart=/usr/bin/flock --nonblock /run/lock/icloud-code-platform-backup.lock /usr/local/sbin/icloud-code-platform-backup backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=45min
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/icloud/icloud-code-api/data/platform /var/backups/icloud-code-platform /var/lib/icloud-code-platform-backup /var/cache/icloud-code-platform-restic /run/lock

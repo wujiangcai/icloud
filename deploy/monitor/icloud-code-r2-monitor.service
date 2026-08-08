@@ -1,0 +1,25 @@
+[Unit]
+Description=Collect Cloudflare R2 usage for iCloud Code Platform
+Documentation=https://developers.cloudflare.com/r2/platform/metrics-analytics/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+EnvironmentFile=/etc/icloud-code-platform/backup-r2.env
+EnvironmentFile=/etc/icloud-code-platform/cloudflare-api.env
+EnvironmentFile=/etc/icloud-code-platform/r2-monitor.env
+ExecStart=/usr/local/sbin/icloud-code-r2-monitor
+Nice=10
+TimeoutStartSec=5min
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/icloud/icloud-code-api/data/platform
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true

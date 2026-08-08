@@ -73,6 +73,12 @@ http://127.0.0.1/platform/admin
 docker compose --env-file .env.platform -f compose.platform.yaml up -d --build
 ~~~
 
+## Linux 备份与 R2 成本保护
+
+Linux 生产机可选用仓库根目录的 [`deploy/`](../deploy/README.md) 文件：它提供
+本机与 R2 的加密备份、恢复说明、Cloudflare 预算告警以及 15 分钟一次的 R2 用量监控。
+这些文件需要 root-only Secret 环境文件，示例中不含任何实际令牌或 S3 密钥。
+
 ## 国内服务器与 Cloudflare Tunnel
 
 国内服务器可以通过 Cloudflare Tunnel 使用自定义域名访问。推荐让
@@ -128,8 +134,12 @@ PLATFORM_CODE_MAX_AGE_SECONDS 默认 3600 秒，只控制页面允许显示多�
 
 ~~~dotenv
 PLATFORM_WORKER_INTERVAL_SECONDS=60
-PLATFORM_HME_GENERATION_BATCH_LIMIT=1
+PLATFORM_HME_GENERATION_BATCH_LIMIT=5
+PLATFORM_HME_GENERATION_COOLDOWN_MINUTES=60
 ~~~
+
+邮箱生成保持每批 5 个，由 60 分钟冷却控制为每小时 5 个。只调高 worker
+轮询间隔来降低后台空转开销；把批量上限改成 1 会直接降为每小时 1 个。
 
 建议：
 

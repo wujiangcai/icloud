@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly backup timer for iCloud Code Platform
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5min
+AccuracySec=1min
+Persistent=true
+Unit=icloud-code-platform-backup.service
+
+[Install]
+WantedBy=timers.target

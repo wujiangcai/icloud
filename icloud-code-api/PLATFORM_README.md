@@ -118,7 +118,20 @@ Authorization: Bearer <SESSION>
 ```http
 GET /api/v1/public/mail/<PUBLIC_TOKEN>/latest
 GET /public/mail/<PUBLIC_TOKEN>
+GET /public/mail/<PUBLIC_TOKEN>/latest
+GET /public/mail/<PUBLIC_TOKEN>?format=json
 ```
+
+`viewer_url` 和 `api_url` 现在是同一个统一链接。浏览器导航请求返回查看页；普通 API 请求、
+`fetch` 请求或 `Accept: application/json` 请求返回 JSON。旧的 `canonical_api_url` 和上面的
+`/latest`、`?format=json` 入口仍然兼容。公开 API 不需要登录或邮箱 Key。`code` 只返回
+`PLATFORM_CODE_MAX_AGE_SECONDS`（默认 3600 秒）内的验证码，历史邮件仍在 `messages` 中。
+每次取码请求会先按 `PLATFORM_REQUEST_SYNC_COOLDOWN_SECONDS`（默认 8 秒）刷新一次 IMAP，
+避免只读后台轮询缓存；响应中的 `code_received_at` 和 `synced_at` 可用于确认邮件与同步时间。
+每个公开链接只读取它绑定的那个邮箱，不会跨邮箱挑选其他别名的验证码。
+
+从其他网站的浏览器 JavaScript 跨域调用时，还需要在 `PLATFORM_CORS_ORIGINS` 中列出调用方
+来源；服务器端脚本、curl 和同源调用不需要 CORS 配置。
 
 重置公开链接再次调用 `POST`；撤销调用 `DELETE /api/v1/mailboxes/<MAILBOX_ID>/public-access`。公开接口不返回 App 专用密码或邮箱 API Key，且设置 `no-store` 和 `no-referrer`。
 
@@ -141,6 +154,15 @@ R2_MAX_OBJECT_BYTES=5242880
 ```
 
 同步邮件时，平台会按租户、邮箱和 IMAP UID 的 SHA-256 路径归档原始 `.eml`；SQLite 保存对象 Key 和归档错误，不保存 R2 密钥。默认本地安全上限为每月 90 万次 PUT、9 GB 上传量和单个对象 5 MB，低于 R2 免费额度；达到上限后自动停止归档但仍继续取码。`R2_REQUIRED=false` 时归档失败不会阻断 IMAP 取码，`true` 时归档失败会让该次同步失败。新凭据应写入服务器 Secret/私有环境文件，不要粘贴到聊天、Git 或日志中。
+
+生产部署可使用仓库的 [Linux 部署文件](../deploy/README.md) 启用以下保护：
+
+- 每 15 分钟统计私有 R2 Bucket 的精确对象容量，并在管理员控制台展示；
+- 7 GB 存储或接近免费操作额度时警告，8 GB 或操作硬限制时阻止本服务继续写入 R2；
+- 每小时以 restic 加密备份数据库、平台密钥和部署配置到本地及 R2；
+- 通过 Cloudflare 预算告警在账户产生用量计费时发送邮件。
+
+Cloudflare 的预算告警只负责通知，不能冻结账户；因此服务端仍保留独立的写入保护。其他凭据或其他 Cloudflare 产品产生的费用不受本服务硬限制影响。
 
 ## 数据与备份
 

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>iCloud 库存控制台</title>
-  <link rel="stylesheet" href="/operator.css">
+  <link rel="stylesheet" href="../operator.css">
 </head>
 <body>
   <section id="loginView" class="login-shell">
@@ -28,7 +28,7 @@
         <button data-view="inventory">▤　邮箱库存</button>
         <button data-view="tenants">♙　客户管理</button>
       </nav>
-      <div class="side-foot"><div>R2 归档用量</div><strong id="r2Text">加载中…</strong><div class="progress"><i id="r2Bar"></i></div></div>
+      <div class="side-foot"><div>R2 实际总用量</div><strong id="r2Text">加载中…</strong><div class="progress"><i id="r2Bar"></i></div></div>
     </aside>
     <main class="main">
       <header class="topbar">
@@ -38,6 +38,17 @@
       <div class="content">
         <section id="overviewView" class="view active">
           <div id="overviewStats" class="stats"></div>
+          <div class="panel r2-monitor-panel">
+            <div class="panel-head"><div><h2>Cloudflare R2 与备份监控</h2><p>直接读取两个 Bucket 的实际对象容量，并监控免费层与计费告警。</p></div><div class="r2-monitor-actions"><span id="r2StatusBadge" class="monitor-badge">加载中</span><a id="r2DashboardLink" class="button small" target="_blank" rel="noopener noreferrer">R2 控制台</a><a id="billingDashboardLink" class="button small" target="_blank" rel="noopener noreferrer">计费用量</a></div></div>
+            <div class="r2-monitor-body">
+              <div id="r2MonitorStats" class="monitor-stats"></div>
+              <div class="monitor-meter"><div class="monitor-meter-label"><span>实际存储占免费层比例</span><strong id="r2MeterText">—</strong></div><div class="monitor-meter-track"><i id="r2MeterBar"></i><b class="warning-mark" title="7 GB 警告线"></b><b class="hard-mark" title="8 GB 硬限制"></b></div></div>
+              <div><div class="monitor-section-title">最近用量趋势</div><div id="r2Trend" class="monitor-trend"></div></div>
+              <div><div class="monitor-section-title">Bucket 明细</div><div id="r2BucketRows" class="monitor-buckets"></div></div>
+              <div id="r2MonitorIssues" class="monitor-issues hidden"></div>
+              <div id="r2MonitorMeta" class="monitor-meta">等待采集…</div>
+            </div>
+          </div>
           <div class="panel"><div class="panel-head"><div><h2>业务状态分布</h2><p>业务状态和 active 操作状态分开管理。</p></div></div><div id="overviewChips" class="chips"></div></div>
           <div class="panel gap"><div class="panel-head"><div><h2>批量生成任务</h2><p>后台 worker 会按每个 Apple 账号的冷却时间继续执行。</p></div></div><div id="jobTable"></div></div>
         </section>
@@ -59,6 +70,6 @@
     </main>
   </section>
   <div id="modalRoot" class="hidden"></div><div id="toast" class="toast hidden"></div>
-  <script src="/operator.js" defer></script>
+  <script src="../operator.js" defer></script>
 </body>
 </html>
