@@ -21,6 +21,11 @@ class PublicLinkContractTests(unittest.TestCase):
         self.assertIn('sec-fetch-dest', self.app_source)
         self.assertIn('return True', self.app_source)
         self.assertIn('"canonical_api_url"', self.app_source)
+        self.assertIn('def sync_before_code_read', self.app_source)
+        self.assertIn('PLATFORM_REQUEST_SYNC_COOLDOWN_SECONDS', self.app_source)
+        self.assertIn('parse_imap_internal_date', self.app_source)
+        self.assertIn('"code_received_at"', self.app_source)
+        self.assertIn('ORDER BY datetime(received_at) DESC,id DESC', self.app_source)
 
     def test_operator_output_exposes_api_url(self):
         self.assertIn('统一查看 / API 链接', self.operator_source)
@@ -34,6 +39,8 @@ class PublicLinkContractTests(unittest.TestCase):
         self.assertIn("GET /public/mail/<PUBLIC_TOKEN>/latest", self.readme)
         self.assertIn("GET /public/mail/<PUBLIC_TOKEN>?format=json", self.readme)
         self.assertIn("PLATFORM_CODE_MAX_AGE_SECONDS", self.readme)
+        self.assertIn("PLATFORM_REQUEST_SYNC_COOLDOWN_SECONDS", self.readme)
+        self.assertIn("每个公开链接只读取它绑定的那个邮箱", self.readme)
 
 
 if __name__ == "__main__":

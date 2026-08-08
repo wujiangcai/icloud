@@ -126,6 +126,9 @@ GET /public/mail/<PUBLIC_TOKEN>?format=json
 `fetch` 请求或 `Accept: application/json` 请求返回 JSON。旧的 `canonical_api_url` 和上面的
 `/latest`、`?format=json` 入口仍然兼容。公开 API 不需要登录或邮箱 Key。`code` 只返回
 `PLATFORM_CODE_MAX_AGE_SECONDS`（默认 3600 秒）内的验证码，历史邮件仍在 `messages` 中。
+每次取码请求会先按 `PLATFORM_REQUEST_SYNC_COOLDOWN_SECONDS`（默认 8 秒）刷新一次 IMAP，
+避免只读后台轮询缓存；响应中的 `code_received_at` 和 `synced_at` 可用于确认邮件与同步时间。
+每个公开链接只读取它绑定的那个邮箱，不会跨邮箱挑选其他别名的验证码。
 
 从其他网站的浏览器 JavaScript 跨域调用时，还需要在 `PLATFORM_CORS_ORIGINS` 中列出调用方
 来源；服务器端脚本、curl 和同源调用不需要 CORS 配置。
